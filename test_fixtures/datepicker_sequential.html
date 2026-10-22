@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TNPSC Style Sequential Date Picker</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f7f6;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .form-container {
+            background-color: #ffffff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+            width: 420px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #333;
+        }
+        /* TNPSC uses a grid or row system for the 3 dropdown fields */
+        .tnpsc-date-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .tnpsc-select {
+            flex: 1;
+            padding: 10px;
+            font-size: 15px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background-color: #fff;
+            cursor: pointer;
+        }
+        .tnpsc-select:disabled {
+            background-color: #e9ecef;
+            cursor: not-allowed;
+            color: #6c757d;
+        }
+        .tnpsc-select:focus {
+            outline: none;
+            border-color: #0056b3;
+        }
+        /* Hidden input field that safely stores the validated string format for your database submit */
+        #finalFormattedDate {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<div class="form-container">
+    <label>Date of Birth (தேதி):</label>
+    
+    <div class="tnpsc-date-row">
+        <!-- 1st Selection Step: YEAR -->
+        <select id="dobYear" class="tnpsc-select" required>
+            <option value="" selected disabled>Select Year</option>
+        </select>
+
+        <!-- 2nd Selection Step: MONTH (Initially Locked) -->
+        <select id="dobMonth" class="tnpsc-select" disabled required>
+            <option value="" selected disabled>Select Month</option>
+            <option value="01">January</option>
+            <option value="02">February</option>
+            <option value="03">March</option>
+            <option value="04">April</option>
+            <option value="05">May</option>
+            <option value="06">June</option>
+            <option value="07">July</option>
+            <option value="08">August</option>
+            <option value="09">September</option>
+            <option value="10">October</option>
+            <option value="11">November</option>
+            <option value="12">December</option>
+        </select>
+
+        <!-- 3rd Selection Step: DATE (Initially Locked) -->
+        <select id="dobDay" class="tnpsc-select" disabled required>
+            <option value="" selected disabled>Select Date</option>
+        </select>
+    </div>
+
+    <!-- Hidden native entry used when submitting standard form actions -->
+    <input type="text" id="finalFormattedDate" name="dob" readonly>
+</div>
+
+<script>
+    const yearSelect = document.getElementById('dobYear');
+    const monthSelect = document.getElementById('dobMonth');
+    const daySelect = document.getElementById('dobDay');
+    const finalHiddenInput = document.getElementById('finalFormattedDate');
+
+    // Populate Year choices dynamically (e.g., matching typical exam eligibility ranges)
+    const currentYear = new Date().getFullYear();
+    const startYear = currentYear - 60; // 60 years ago
+    const endYear = currentYear - 18;   // 18 years ago (Minimum age requirement)
+
+    for (let y = endYear; y >= startYear; y--) {
+        let opt = document.createElement('option');
+        opt.value = y;
+        opt.textContent = y;
+        yearSelect.appendChild(opt);
+    }
+
+    // Step 1: When Year is picked -> Unlock Month
+    yearSelect.addEventListener('change', () => {
+        monthSelect.disabled = false;
+        monthSelect.selectedIndex = 0; // Reset Month
+        daySelect.selectedIndex = 0;   // Reset Day
+        daySelect.disabled = true;     // Relock Day until month is picked
+        updateHiddenValue();
+    });
+
+    // Step 2: When Month is picked -> Calculate accurate days and Unlock Date
+    monthSelect.addEventListener('change', () => {
+        daySelect.disabled = false;
+        
+        // Clear previous date numbers options except the index 0 placeholder
+        daySelect.innerHTML = '<option value="" selected disabled>Select Date</option>';
+
+        const selectedYear = parseInt(yearSelect.value);
+        const selectedMonth = parseInt(monthSelect.value);
+
+        // Get total number of days in that specific chosen year/month combination
+        // (This elegantly handles leap years for February automatically!)
+        const totalDays = new Date(selectedYear, selectedMonth, 0).getDate();
+
+        for (let d = 1; d <= totalDays; d++) {
+            let opt = document.createElement('option');
+            // Ensure two digit formats (01, 02, etc)
+            let paddedDay = d.toString().padStart(2, '0');
+            opt.value = paddedDay;
+            opt.textContent = paddedDay;
+            daySelect.appendChild(opt);
+        }
+        updateHiddenValue();
+    });
+
+    // Step 3: When Date is chosen -> Compile string
+    daySelect.addEventListener('change', () => {
+        updateHiddenValue();
+    });
+
+    function updateHiddenValue() {
+        if (yearSelect.value && monthSelect.value && daySelect.value) {
+            // Generates standard YYYY-MM-DD backend string format
+            finalHiddenInput.value = `${yearSelect.value}-${monthSelect.value}-${daySelect.value}`;
+            console.log("Saved Date Value:", finalHiddenInput.value);
+        } else {
+            finalHiddenInput.value = "";
+        }
+    }
+</script>
+
+</body>
+</html>
