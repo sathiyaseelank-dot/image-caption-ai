@@ -99,6 +99,47 @@ def get_orca_snapshot() -> Dict[str, Any]:
 
     if not isinstance(data, dict) or "result" not in data:
         raise OrcaError(f"Unexpected snapshot structure from Orca: missing 'result' object.")
+
+    # Automatically enrich unlabelled inputs with surrounding DOM labels (e.g. table/bootstrap layouts)
+    refs = data.get("result", {}).get("refs", {})
+    unlabelled_refs = [
+        ref_id for ref_id, info in refs.items()
+        if info.get("role") in ["textbox", "combobox", "searchbox", "search"] and not info.get("name", "").strip()
+    ]
+
+    if unlabelled_refs:
+        js = """
+        (() => {
+            const inputs = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"));
+            return inputs.map((el, i) => {
+                let label = "";
+                if (el.labels && el.labels[0]) label = el.labels[0].innerText.trim();
+                else if (el.getAttribute("aria-label")) label = el.getAttribute("aria-label").trim();
+                else if (el.placeholder) label = el.placeholder.trim();
+                else if (el.parentElement && el.parentElement.previousElementSibling) {
+                    const prev = el.parentElement.previousElementSibling.innerText.trim();
+                    if (prev.length < 50) label = prev;
+                }
+                else if (el.closest("td") && el.closest("td").previousElementSibling) {
+                    const prev = el.closest("td").previousElementSibling.innerText.trim();
+                    if (prev.length < 50) label = prev;
+                }
+                if (!label && el.name) label = el.name.replace(/^[0-9_]+/, "").replace(/_/g, " ").trim();
+                return { index: i, resolvedLabel: label };
+            });
+        })()
+        """
+        try:
+            dom_out = run_cmd([ORCA_BIN, "eval", "--expression", js])
+            dom_labels = json.loads(dom_out)
+            for i, ref_id in enumerate(unlabelled_refs):
+                if i < len(dom_labels):
+                    lbl = dom_labels[i].get("resolvedLabel")
+                    if lbl:
+                        refs[ref_id]["name"] = lbl
+        except Exception:
+            pass
+
     return data
 
 def get_page_verification_state() -> Dict[str, Any]:
@@ -594,7 +635,7 @@ def search_elements(query: str, top_k: int = 5):
         if score > 0:
             scored.append((score, el))
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
+    scored.sort(key=lambda x: x[0], reverse=True)
 
     print(f"\n🔍 Querying Orca Active Page for: '{query}'...")
     print(f"🌐 Page Origin: {origin}")
@@ -614,19 +655,18 @@ def search_elements(query: str, top_k: int = 5):
                 print(f"   • [{el['ref']}] \"{el['name']}\" (Score: {s})")
             print("-" * 70)
 
-    for i, res in enumerate(scored[:top_k], 1):
-        ref = res["ref"]
-        role = res["role"]
-        name = res["name"] if len(res["name"]) <= 60 else res["name"][:57] + "..."
-        score = res["score"]
-        action = res["suggested_action"]
+    for i, (score, el) in enumerate(scored[:top_k], 1):
+        ref = el["ref"]
+        role = el["role"]
+        name = el["name"] if len(el["name"]) <= 60 else el["name"][:57] + "..."
+        action = el["suggested_action"]
 
-        print(f"#{i} [{res['ref']}] (Score: {score})")
+        print(f"#{i} [{ref}] (Score: {score})")
         print(f"   Role: {role:<12} | Name: \"{name}\"")
         if action == "fill":
-            print(f"   👉 One-Step Fill : python3 orca_smart_search.py --fill \"{res['name']}\" \"<text>\"")
+            print(f"   👉 One-Step Fill : python3 orca_smart_search.py --fill \"{el['name']}\" \"<text>\"")
         else:
-            print(f"   👉 One-Step Click: python3 orca_smart_search.py --click \"{res['name']}\"")
+            print(f"   👉 One-Step Click: python3 orca_smart_search.py --click \"{el['name']}\"")
         print("-" * 70)
 
 def main():
