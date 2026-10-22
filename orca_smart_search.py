@@ -125,6 +125,21 @@ def get_orca_snapshot() -> Dict[str, Any]:
                     if (prev.length < 50) label = prev;
                 }
                 if (!label && el.name) label = el.name.replace(/^[0-9_]+/, "").replace(/_/g, " ").trim();
+
+                // Qualify date dropdowns (Month / Day / Year)
+                if (el.tagName === 'SELECT' && el.options && el.options.length > 0) {
+                    const firstText = el.options[0].text.trim().toLowerCase();
+                    if (['month', 'day', 'year', 'mm', 'dd', 'yy'].includes(firstText)) {
+                        label = (label ? label + ' - ' : '') + el.options[0].text.trim();
+                    } else if (el.name && (el.name.endsWith('mm') || el.name.includes('month'))) {
+                        label = (label ? label + ' - ' : '') + 'Month';
+                    } else if (el.name && (el.name.endsWith('dd') || el.name.includes('day'))) {
+                        label = (label ? label + ' - ' : '') + 'Day';
+                    } else if (el.name && (el.name.endsWith('yy') || el.name.includes('year'))) {
+                        label = (label ? label + ' - ' : '') + 'Year';
+                    }
+                }
+
                 return { index: i, resolvedLabel: label };
             });
         })()
@@ -559,12 +574,64 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
     print(f"\n🎯 Finding target field for fill: '{target}'...")
     ref, info = resolve_target_element(target)
     name = info.get("name") or info.get("role")
-    print(f"👉 Matched input field: [{ref}] \"{name}\"")
+    role = info.get("role", "")
+    print(f"👉 Matched input field: [{ref}] \"{name}\" ({role})")
+
+    # If target is a dropdown / combobox / select, handle text-to-value resolution
+    select_js = rf"""
+    (() => {{
+        const targetName = {json.dumps(name)};
+        const desiredVal = {json.dumps(value)};
+        const target = targetName.toLowerCase();
+        const desired = desiredVal.toLowerCase();
+        const words = target.split(/[\s\-_]+/).filter(Boolean);
+        const selects = Array.from(document.querySelectorAll('select'));
+        
+        let bestSelect = null;
+        let bestScore = -1;
+        
+        selects.forEach(s => {{
+            let l = '';
+            if (s.labels && s.labels[0]) l = s.labels[0].innerText;
+            else if (s.parentElement && s.parentElement.previousElementSibling) l = s.parentElement.previousElementSibling.innerText;
+            const text = (l + ' ' + s.name + ' ' + (s.options[0]?.text || '')).toLowerCase();
+            let score = 0;
+            words.forEach(w => {{ if (text.includes(w)) score++; }});
+            if (score > bestScore) {{
+                bestScore = score;
+                bestSelect = s;
+            }}
+        }});
+
+        if (bestSelect) {{
+            bestSelect.scrollIntoView({{block: 'center'}});
+            const opt = Array.from(bestSelect.options).find(o => 
+                o.text.trim().toLowerCase() === desired ||
+                o.text.trim().toLowerCase().startsWith(desired) ||
+                o.value.trim().toLowerCase() === desired
+            );
+            if (opt) {{
+                bestSelect.value = opt.value;
+                bestSelect.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return 'select_set:' + opt.text;
+            }}
+        }}
+        return 'standard';
+    }})()
+    """
+    try:
+        res = run_cmd([ORCA_BIN, "eval", "--expression", select_js])
+        if "select_set:" in res:
+            selected_text = res.split("select_set:")[1]
+            print(f"⚡ Selected dropdown option: \"{selected_text}\"")
+        else:
+            print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
+            run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
+    except Exception:
+        print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
+        run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
 
     before_state = get_page_verification_state()
-    print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
-    run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
-
     time.sleep(0.3)
     after_state = get_page_verification_state()
     comparison = compare_page_states(before_state, after_state)
