@@ -415,7 +415,7 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         if role in ["generic", "none", "presentation"] and not name:
             continue
 
-        is_input = role in ["combobox", "textbox", "searchbox", "search"]
+        is_input = role in ["combobox", "textbox", "searchbox", "search", "spinbutton", "date"]
         is_button = role in ["button", "menuitem", "switch"]
         is_link = role == "link"
 
