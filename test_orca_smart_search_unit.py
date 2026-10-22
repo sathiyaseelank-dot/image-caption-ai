@@ -156,6 +156,13 @@ class TestPageStateComparison(unittest.TestCase):
         self.assertEqual(res["verdict"], "SUCCESS_NOTIFICATION")
         self.assertEqual(res["new_success_alerts"], ["Success: Reservation confirmed for Agent Smith!"])
 
+    def test_parse_date_value_formats(self):
+        self.assertEqual(oss.parse_date_value("2002-11-03"), "2002-11-03")
+        self.assertEqual(oss.parse_date_value("2002 and nov 03"), "2002-11-03")
+        self.assertEqual(oss.parse_date_value("November 3, 2002"), "2002-11-03")
+        self.assertEqual(oss.parse_date_value("03/11/2002"), "2002-11-03")
+        self.assertIsNone(oss.parse_date_value("just plain text"))
+
     def test_modal_opened_detected(self):
         before = {"url": "https://example.com/form", "dialogs": []}
         after = {"url": "https://example.com/form", "dialogs": ["Confirmation"]}

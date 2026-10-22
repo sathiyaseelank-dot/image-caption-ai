@@ -403,9 +403,80 @@ def print_verification_report(res: Dict[str, Any]):
 
     print("=" * 70)
 
+def parse_date_value(val: str) -> Optional[str]:
+    """Tries to parse various natural date formats into standard YYYY-MM-DD."""
+    val = val.strip()
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', val):
+        return val
+
+    months = {
+        'jan': '01', 'january': '01', 'feb': '02', 'february': '02',
+        'mar': '03', 'march': '03', 'apr': '04', 'april': '04',
+        'may': '05', 'jun': '06', 'june': '06', 'jul': '07', 'july': '07',
+        'aug': '08', 'august': '08', 'sep': '09', 'september': '09',
+        'oct': '10', 'october': '10', 'nov': '11', 'november': '11',
+        'dec': '12', 'december': '12'
+    }
+
+    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', val)
+    year = year_match.group(1) if year_match else None
+
+    month = None
+    for m_name, m_num in months.items():
+        if re.search(r'\b' + m_name + r'\b', val, re.IGNORECASE):
+            month = m_num
+            break
+
+    cleaned = re.sub(r'\b(19\d{2}|20\d{2})\b', '', val)
+    for m_name in months.keys():
+        cleaned = re.sub(r'\b' + m_name + r'\b', '', cleaned, flags=re.IGNORECASE)
+
+    day_match = re.search(r'\b(0?[1-9]|[12]\d|3[01])\b', cleaned)
+    day = f"{int(day_match.group(1)):02d}" if day_match else None
+
+    if year and month and day:
+        return f"{year}-{month}-{day}"
+
+    slash_match = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', val)
+    if slash_match:
+        p1, p2, p3 = slash_match.groups()
+        if int(p1) > 12:
+            return f"{p3}-{int(p2):02d}-{int(p1):02d}"
+        elif int(p2) > 12:
+            return f"{p3}-{int(p1):02d}-{int(p2):02d}"
+        else:
+            return f"{p3}-{int(p2):02d}-{int(p1):02d}"
+
+    return None
+
+def extract_ancestor_contexts(snapshot_text: str) -> Dict[str, str]:
+    ref_contexts = {}
+    stack = []
+    for line in snapshot_text.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+
+        m_label = re.search(r'([A-Za-z]+)\s+"([^"]+)"', line)
+        current_label = m_label.group(2) if m_label else ""
+
+        m_ref = re.search(r'\[(?:[^\]]*ref=)?(e\d+)\]', line)
+        if m_ref:
+            ref_id = m_ref.group(1)
+            ancestors = [item[1] for item in stack if item[1]]
+            ref_contexts[ref_id] = " ".join(ancestors)
+
+        if current_label:
+            stack.append((indent, current_label))
+    return ref_contexts
+
 def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = snapshot_data.get("result", {})
     refs = result.get("refs", {})
+    snapshot_text = result.get("snapshot", "")
+    ancestor_contexts = extract_ancestor_contexts(snapshot_text) if snapshot_text else {}
     pruned = []
 
     for ref_id, info in refs.items():
@@ -419,7 +490,13 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         is_button = role in ["button", "menuitem", "switch"]
         is_link = role == "link"
 
-        semantic_text = f"{name} {role}".strip()
+        context = ancestor_contexts.get(ref_id, "")
+        if context and context.lower() not in name.lower():
+            display_name = f"{context} {name}".strip()
+        else:
+            display_name = name
+
+        semantic_text = f"{context} {name} {role}".strip()
         if not semantic_text:
             continue
 
@@ -428,7 +505,9 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         pruned.append({
             "ref": ref_id,
             "role": role,
-            "name": name,
+            "name": display_name,
+            "raw_name": name,
+            "context": context,
             "is_input": is_input,
             "is_button": is_button,
             "is_link": is_link,
@@ -600,59 +679,101 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
     role = info.get("role", "")
     print(f"👉 Matched input field: [{ref}] \"{name}\" ({role})")
 
-    # If target is a dropdown / combobox / select, handle text-to-value resolution
-    select_js = rf"""
-    (() => {{
-        const targetName = {json.dumps(name)};
-        const desiredVal = {json.dumps(value)};
-        const target = targetName.toLowerCase();
-        const desired = desiredVal.toLowerCase();
-        const words = target.split(/[\s\-_]+/).filter(Boolean);
-        const selects = Array.from(document.querySelectorAll('select'));
-        
-        let bestSelect = null;
-        let bestScore = -1;
-        
-        selects.forEach(s => {{
-            let l = '';
-            if (s.labels && s.labels[0]) l = s.labels[0].innerText;
-            else if (s.parentElement && s.parentElement.previousElementSibling) l = s.parentElement.previousElementSibling.innerText;
-            const text = (l + ' ' + s.name + ' ' + (s.options[0]?.text || '')).toLowerCase();
-            let score = 0;
-            words.forEach(w => {{ if (text.includes(w)) score++; }});
-            if (score > bestScore) {{
-                bestScore = score;
-                bestSelect = s;
-            }}
-        }});
+    parsed_date = parse_date_value(value)
+    date_handled = False
+    actual_filled_val = value
 
-        if (bestSelect) {{
-            bestSelect.scrollIntoView({{block: 'center'}});
-            const opt = Array.from(bestSelect.options).find(o => 
-                o.text.trim().toLowerCase() === desired ||
-                o.text.trim().toLowerCase().startsWith(desired) ||
-                o.value.trim().toLowerCase() === desired
-            );
-            if (opt) {{
-                bestSelect.value = opt.value;
-                bestSelect.dispatchEvent(new Event('change', {{bubbles: true}}));
-                return 'select_set:' + opt.text;
+    # Smart date input handler (supports native datepickers, spinbuttons, and natural date strings)
+    if parsed_date or role in ["spinbutton", "date"] or any(k in str(name).lower() for k in ["date", "dob", "birth", "month", "year"]):
+        iso_val = parsed_date or value
+        date_js = rf"""
+        (() => {{
+            const targetName = {json.dumps(name or "")};
+            const targetQuery = {json.dumps(target)};
+            const isoVal = {json.dumps(iso_val)};
+            const dateInputs = Array.from(document.querySelectorAll('input[type="date"], input[type="datetime-local"]'));
+            if (dateInputs.length === 0) return 'no_date_inputs';
+            let bestInput = dateInputs[0];
+            if (dateInputs.length > 1) {{
+                const q = (targetName + ' ' + targetQuery).toLowerCase();
+                dateInputs.forEach(inp => {{
+                    let label = '';
+                    if (inp.labels && inp.labels[0]) label = inp.labels[0].innerText;
+                    else if (inp.closest('label')) label = inp.closest('label').innerText;
+                    const combined = (label + ' ' + inp.name + ' ' + inp.id).toLowerCase();
+                    if (q.split(/\s+/).some(w => combined.includes(w))) bestInput = inp;
+                }});
             }}
-        }}
-        return 'standard';
-    }})()
-    """
-    try:
-        res = run_cmd([ORCA_BIN, "eval", "--expression", select_js])
-        if "select_set:" in res:
-            selected_text = res.split("select_set:")[1]
-            print(f"⚡ Selected dropdown option: \"{selected_text}\"")
-        else:
+            bestInput.value = isoVal;
+            bestInput.dispatchEvent(new Event('input', {{bubbles: true}}));
+            bestInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+            return 'date_set:' + bestInput.value;
+        }})()
+        """
+        try:
+            date_res = run_cmd([ORCA_BIN, "eval", "--expression", date_js])
+            if "date_set:" in date_res:
+                actual_date = date_res.split("date_set:")[1]
+                print(f"⚡ Set date field: \"{actual_date}\"")
+                date_handled = True
+                actual_filled_val = actual_date
+        except Exception:
+            pass
+
+    if not date_handled:
+        # If target is a dropdown / combobox / select, handle text-to-value resolution
+        select_js = rf"""
+        (() => {{
+            const targetName = {json.dumps(name)};
+            const desiredVal = {json.dumps(value)};
+            const target = targetName.toLowerCase();
+            const desired = desiredVal.toLowerCase();
+            const words = target.split(/[\s\-_]+/).filter(Boolean);
+            const selects = Array.from(document.querySelectorAll('select'));
+            
+            let bestSelect = null;
+            let bestScore = -1;
+            
+            selects.forEach(s => {{
+                let l = '';
+                if (s.labels && s.labels[0]) l = s.labels[0].innerText;
+                else if (s.parentElement && s.parentElement.previousElementSibling) l = s.parentElement.previousElementSibling.innerText;
+                const text = (l + ' ' + s.name + ' ' + (s.options[0]?.text || '')).toLowerCase();
+                let score = 0;
+                words.forEach(w => {{ if (text.includes(w)) score++; }});
+                if (score > bestScore) {{
+                    bestScore = score;
+                    bestSelect = s;
+                }}
+            }});
+
+            if (bestSelect) {{
+                bestSelect.scrollIntoView({{block: 'center'}});
+                const opt = Array.from(bestSelect.options).find(o => 
+                    o.text.trim().toLowerCase() === desired ||
+                    o.text.trim().toLowerCase().startsWith(desired) ||
+                    o.value.trim().toLowerCase() === desired
+                );
+                if (opt) {{
+                    bestSelect.value = opt.value;
+                    bestSelect.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return 'select_set:' + opt.text;
+                }}
+            }}
+            return 'standard';
+        }})()
+        """
+        try:
+            res = run_cmd([ORCA_BIN, "eval", "--expression", select_js])
+            if "select_set:" in res:
+                selected_text = res.split("select_set:")[1]
+                print(f"⚡ Selected dropdown option: \"{selected_text}\"")
+            else:
+                print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
+                run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
+        except Exception:
             print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
             run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
-    except Exception:
-        print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
-        run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
 
     before_state = get_page_verification_state()
     time.sleep(0.3)
@@ -662,7 +783,7 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
     print("\n" + "=" * 70)
     print(" 🔎 INPUT VERIFICATION REPORT")
     print("=" * 70)
-    print(f"✅ Filled element [{ref}] with: \"{value}\"")
+    print(f"✅ Filled element [{ref}] with: \"{actual_filled_val}\"")
     if comparison.get("all_invalid_inputs"):
         matching_invalid = [i for i in comparison["all_invalid_inputs"] if i.get("label") == name or i.get("id") == ref]
         if matching_invalid:
