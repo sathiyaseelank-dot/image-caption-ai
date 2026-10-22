@@ -254,6 +254,17 @@ def get_page_verification_state() -> Dict[str, Any]:
             "error": str(e)
         }
 
+def is_error_alert(alert_text: str) -> bool:
+    """Distinguishes between error/warning alerts and positive/success confirmation notices."""
+    text_lower = alert_text.lower()
+    positive_cues = ["success", "confirmed", "successfully", "saved", "completed", "submitted", "done", "scheduled", "booked"]
+    error_cues = ["error", "fail", "invalid", "required", "warning", "denied", "reject", "prevented", "blocked", "disabled"]
+    has_positive = any(c in text_lower for c in positive_cues)
+    has_error = any(c in text_lower for c in error_cues)
+    if has_positive and not has_error:
+        return False
+    return True
+
 def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit_action: bool = False) -> Dict[str, Any]:
     """Analyzes differences between before and after states to determine outcome."""
     if after.get("error"):
@@ -265,6 +276,8 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
             "new_invalid_inputs": [],
             "all_alerts": [],
             "new_alerts": [],
+            "new_error_alerts": [],
+            "new_success_alerts": [],
             "active_dialogs": []
         }
 
@@ -282,6 +295,8 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
     # Detect new alerts
     before_alerts = set(before.get("alerts", []))
     new_alerts = [a for a in after.get("alerts", []) if a not in before_alerts]
+    new_error_alerts = [a for a in new_alerts if is_error_alert(a)]
+    new_success_alerts = [a for a in new_alerts if not is_error_alert(a)]
 
     # Detect dialogs
     before_dialogs = before.get("dialogs", [])
@@ -302,11 +317,13 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
     # Determine verdict safely without false positives from pre-existing background errors
     if url_changed:
         verdict = "NAVIGATED"
-    elif new_invalids or new_alerts:
+    elif new_invalids or new_error_alerts:
         verdict = "VALIDATION_ERROR"
     elif is_submit_action and all_current_invalids and not url_changed:
         # User explicitly tried to submit, but form validation blocked navigation
         verdict = "VALIDATION_ERROR"
+    elif new_success_alerts:
+        verdict = "SUCCESS_NOTIFICATION"
     elif dialog_opened:
         verdict = "MODAL_OPENED"
     elif dialog_closed:
@@ -327,6 +344,8 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
         "new_invalid_inputs": new_invalids,
         "all_invalid_inputs": all_current_invalids,
         "new_alerts": new_alerts,
+        "new_error_alerts": new_error_alerts,
+        "new_success_alerts": new_success_alerts,
         "all_alerts": after.get("alerts", []),
         "dialog_opened": dialog_opened,
         "dialog_closed": dialog_closed,
@@ -346,6 +365,10 @@ def print_verification_report(res: Dict[str, Any]):
         print("✅ STATUS: SUCCESSFUL NAVIGATION")
         print(f"   From : {res['from_url']}")
         print(f"   To   : {res['to_url']}")
+    elif verdict == "SUCCESS_NOTIFICATION":
+        print("✅ STATUS: SUCCESS NOTIFICATION / ACTION CONFIRMED")
+        for a in res.get("new_success_alerts", []):
+            print(f"   🎉 \"{a}\"")
     elif verdict == "VALIDATION_ERROR":
         print("❌ STATUS: FORM VALIDATION / SUBMISSION FAILED")
         invalids = res["new_invalid_inputs"] if res["new_invalid_inputs"] else res["all_invalid_inputs"]
@@ -355,7 +378,7 @@ def print_verification_report(res: Dict[str, Any]):
                 name = inp["label"] or inp["name"] or inp["id"]
                 msg = inp["validationMessage"]
                 print(f"      • Field: \"{name}\" ({inp['tag']}) ➔ Error: \"{msg}\"")
-        alerts = res["new_alerts"] if res["new_alerts"] else res["all_alerts"]
+        alerts = res.get("new_error_alerts") or res["new_alerts"] or res["all_alerts"]
         if alerts:
             print("\n   🚨 Alert / Error Banners:")
             for a in alerts:

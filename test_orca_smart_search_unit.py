@@ -142,6 +142,20 @@ class TestPageStateComparison(unittest.TestCase):
         self.assertEqual(res["verdict"], "VALIDATION_ERROR")
         self.assertEqual(len(res["new_invalid_inputs"]), 1)
 
+    def test_validation_error_on_new_error_alert(self):
+        before = {"url": "https://example.com/form", "alerts": []}
+        after = {"url": "https://example.com/form", "alerts": ["Error: Invalid date chosen"]}
+        res = oss.compare_page_states(before, after)
+        self.assertEqual(res["verdict"], "VALIDATION_ERROR")
+        self.assertEqual(res["new_error_alerts"], ["Error: Invalid date chosen"])
+
+    def test_success_notification_on_success_alert(self):
+        before = {"url": "https://example.com/form", "alerts": []}
+        after = {"url": "https://example.com/form", "alerts": ["Success: Reservation confirmed for Agent Smith!"]}
+        res = oss.compare_page_states(before, after)
+        self.assertEqual(res["verdict"], "SUCCESS_NOTIFICATION")
+        self.assertEqual(res["new_success_alerts"], ["Success: Reservation confirmed for Agent Smith!"])
+
     def test_modal_opened_detected(self):
         before = {"url": "https://example.com/form", "dialogs": []}
         after = {"url": "https://example.com/form", "dialogs": ["Confirmation"]}
