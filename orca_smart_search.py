@@ -198,6 +198,17 @@ def get_page_verification_state() -> Dict[str, Any]:
             }
         });
 
+        // 4. Capture snapshot of all form input values
+        const formValues = {};
+        document.querySelectorAll('input:not([type=hidden]), select, textarea').forEach((el, idx) => {
+            let label = '';
+            if (el.labels && el.labels[0]) label = el.labels[0].innerText.trim();
+            else if (el.parentElement && el.parentElement.previousElementSibling) label = el.parentElement.previousElementSibling.innerText.trim();
+            const key = label || el.name || el.id || ('field_' + idx);
+            const val = (el.type === 'checkbox' || el.type === 'radio') ? el.checked : el.value;
+            formValues[key] = String(val);
+        });
+
         const bodyTxt = document.body ? document.body.innerText.trim() : '';
 
         return {
@@ -205,6 +216,7 @@ def get_page_verification_state() -> Dict[str, Any]:
             title: document.title || 'Untitled',
             bodyText: bodyTxt.slice(0, 5000),
             bodyLength: bodyTxt.length,
+            formValues: formValues,
             invalidInputs: invalidInputs,
             alerts: alerts,
             dialogs: dialogs,
@@ -265,6 +277,13 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
     # Detect content text change
     content_changed = before.get("bodyText") != after.get("bodyText")
 
+    # Detect form input values change (e.g. Reset button cleared fields or Autofill populated fields)
+    before_forms = before.get("formValues", {})
+    after_forms = after.get("formValues", {})
+    all_keys = set(before_forms.keys()).union(after_forms.keys())
+    changed_fields = [k for k in all_keys if before_forms.get(k) != after_forms.get(k)]
+    form_values_changed = len(changed_fields) > 0
+
     # Determine verdict safely without false positives from pre-existing background errors
     if url_changed:
         verdict = "NAVIGATED"
@@ -277,6 +296,8 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
         verdict = "MODAL_OPENED"
     elif dialog_closed:
         verdict = "MODAL_CLOSED"
+    elif form_values_changed:
+        verdict = "FORM_UPDATED"
     elif content_changed:
         verdict = "CONTENT_UPDATED"
     else:
@@ -295,7 +316,9 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
         "dialog_opened": dialog_opened,
         "dialog_closed": dialog_closed,
         "active_dialogs": after_dialogs,
-        "content_changed": content_changed
+        "content_changed": content_changed,
+        "form_values_changed": form_values_changed,
+        "changed_fields": changed_fields
     }
 
 def print_verification_report(res: Dict[str, Any]):
@@ -327,6 +350,10 @@ def print_verification_report(res: Dict[str, Any]):
         print(f"   Active Dialogs: {', '.join(res['active_dialogs'])}")
     elif verdict == "MODAL_CLOSED":
         print("ℹ️  STATUS: MODAL / DIALOG CLOSED")
+    elif verdict == "FORM_UPDATED":
+        print("✅ STATUS: FORM VALUES UPDATED (Fields cleared / modified)")
+        if res.get("changed_fields"):
+            print(f"   Modified Fields: {', '.join(res['changed_fields'][:6])}")
     elif verdict == "CONTENT_UPDATED":
         print("✅ STATUS: IN-PAGE CONTENT UPDATED (DOM state changed)")
     elif verdict == "INSPECTION_FAILED":
@@ -493,6 +520,28 @@ def act_click_and_verify(target: str, wait_seconds: float = 1.0) -> Dict[str, An
 
     # Check if this is a submission action
     is_submit = "submit" in target.lower() or "submit" in name.lower() or "save" in target.lower()
+
+    # Auto-scroll element into view so clicks never miss off-screen elements
+    scroll_js = f"""
+    (() => {{
+        const target = {json.dumps(name)};
+        const candidates = Array.from(document.querySelectorAll('button, input, a, select, textarea, [role=button], [role=combobox]'));
+        const match = candidates.find(el => {{
+            const txt = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().toLowerCase();
+            return txt === target.toLowerCase() || txt.includes(target.toLowerCase());
+        }});
+        if (match) {{
+            match.scrollIntoView({{block: 'center', inline: 'center'}});
+            return true;
+        }}
+        return false;
+    }})()
+    """
+    try:
+        run_cmd([ORCA_BIN, "eval", "--expression", scroll_js])
+        time.sleep(0.2)
+    except Exception:
+        pass
 
     before_state = get_page_verification_state()
     print(f"⚡ Executing: orca click --element {ref}")
