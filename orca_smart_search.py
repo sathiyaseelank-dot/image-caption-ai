@@ -618,12 +618,15 @@ def resolve_target_element(target: str, confidence_threshold: float = 1.0) -> Tu
         score_diff = abs(top1_score - top2_score)
 
         if score_diff < 0.15 and top1_el["name"].lower() != top2_el["name"].lower():
-            candidates = [f"[{el['ref']}] \"{el['name']}\" ({el['role']}) (score: {s})" for s, el in scored[:3] if abs(s - top1_score) < 0.15]
-            raise AmbiguousTargetError(
-                f"Query '{target}' is ambiguous between multiple elements:\n  • " +
-                "\n  • ".join(candidates) +
-                "\nPlease provide a more specific label or use the element ref directly."
-            )
+            # If both are sub-parts belonging to the same parent context, don't block as ambiguous
+            same_context = bool(top1_el.get("context")) and top1_el.get("context") == top2_el.get("context")
+            if not same_context:
+                candidates = [f"[{el['ref']}] \"{el['name']}\" ({el['role']}) (score: {s})" for s, el in scored[:3] if abs(s - top1_score) < 0.15]
+                raise AmbiguousTargetError(
+                    f"Query '{target}' is ambiguous between multiple elements:\n  • " +
+                    "\n  • ".join(candidates) +
+                    "\nPlease provide a more specific label or use the element ref directly."
+                )
 
     best = scored[0][1]
     return best["ref"], best
