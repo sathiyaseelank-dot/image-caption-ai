@@ -2,22 +2,32 @@
 """
 Orca Smart DOM Pruner, Semantic Search & Verification Engine
 ------------------------------------------------------------
-- NO LLM required: fast, lightweight, pure algorithmic processing on CPU.
+- Fast, lightweight, pure algorithmic processing on CPU.
 - Page Describer: summarizes content, sections, and available inputs.
 - Semantic Search: matches human intent to UI controls in <5ms.
+- Ambiguity Protection: halts when multiple elements match equally.
 - Change Verification & Error Detection: detects URL changes, validation
-  failures, error banners, modal dialogs, and DOM state updates post-action.
+  failures, error banners, modal dialogs, and DOM text state updates post-action.
+- Robust Error Handling: clear errors for missing binary, timeout, malformed JSON.
 """
 
 import sys
+import os
 import json
 import subprocess
 import re
 import time
-from urllib.parse import urlparse
+import hashlib
+from urllib.parse import urlparse, parse_qs
 from typing import List, Dict, Any, Optional, Tuple
 
-ORCA_BIN = "/home/inkyank-01/.config/orca/linux-orca-cli-shim/orca"
+ORCA_BIN = os.environ.get("ORCA_BIN", "/home/inkyank-01/.config/orca/linux-orca-cli-shim/orca")
+
+# Generic role/type keywords that should not by themselves trigger a substantive match
+GENERIC_ROLE_TOKENS = {
+    "button", "btn", "input", "field", "textbox", "box", "link",
+    "combobox", "select", "dropdown", "textarea", "checkbox", "radio"
+}
 
 INTENT_SYNONYMS = {
     "search": ["query", "find", "lookup", "explore", "searchbox", "bar"],
@@ -29,23 +39,67 @@ INTENT_SYNONYMS = {
     "submit": ["enter", "send", "save", "apply", "go", "order"],
     "login": ["signin", "sign in", "auth", "account"],
     "settings": ["preferences", "options", "config", "tools"],
-    "phone": ["telephone", "mobile", "cell", "contact", "number"],
-    "telephone": ["phone", "mobile", "cell", "number"],
-    "email": ["mail", "e-mail", "address"],
+    "phone": ["telephone", "mobile", "cell", "contact"],
+    "telephone": ["phone", "mobile", "cell"],
+    "email": ["mail", "e-mail"],
     "name": ["customer", "user", "fullname", "person"],
     "comment": ["instruction", "instructions", "notes", "description", "details", "message"],
     "instruction": ["instructions", "comment", "notes", "details"],
+    "notes": ["instruction", "instructions", "comment", "details"],
 }
 
-def run_cmd(args: List[str]) -> str:
-    res = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+class OrcaError(Exception):
+    """Base exception for Orca CLI operations."""
+    pass
+
+class OrcaNotFoundError(OrcaError):
+    """Raised when the Orca executable is not found."""
+    pass
+
+class AmbiguousTargetError(OrcaError):
+    """Raised when a semantic query matches multiple elements with similar confidence."""
+    pass
+
+class ElementNotFoundError(OrcaError):
+    """Raised when no element matches the query."""
+    pass
+
+def run_cmd(args: List[str], timeout: float = 15.0) -> str:
+    """Executes an Orca CLI command with proper error handling and timeout."""
+    if not os.path.exists(ORCA_BIN):
+        raise OrcaNotFoundError(
+            f"Orca executable not found at '{ORCA_BIN}'. "
+            f"Ensure Orca is installed or set the ORCA_BIN environment variable."
+        )
+
+    try:
+        res = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise OrcaError(f"Orca command timed out after {timeout}s: {' '.join(args)}")
+    except FileNotFoundError:
+        raise OrcaNotFoundError(f"Failed to execute '{ORCA_BIN}': file not found.")
+
     if res.returncode != 0:
-        raise RuntimeError(f"Command failed ({res.returncode}): {res.stderr.strip()}")
+        err = res.stderr.strip() or res.stdout.strip()
+        raise OrcaError(f"Command failed (exit code {res.returncode}): {err}")
     return res.stdout.strip()
 
 def get_orca_snapshot() -> Dict[str, Any]:
     out = run_cmd([ORCA_BIN, "snapshot", "--json"])
-    return json.loads(out)
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as e:
+        raise OrcaError(f"Orca returned invalid JSON snapshot: {e}")
+
+    if not isinstance(data, dict) or "result" not in data:
+        raise OrcaError(f"Unexpected snapshot structure from Orca: missing 'result' object.")
+    return data
 
 def get_page_verification_state() -> Dict[str, Any]:
     """
@@ -54,7 +108,7 @@ def get_page_verification_state() -> Dict[str, Any]:
     - Invalid form fields (:invalid, aria-invalid)
     - Visible error messages & alerts
     - Open modal dialogs
-    - Body text length & preview
+    - Body text content hash
     """
     js_code = """
     (() => {
@@ -80,7 +134,7 @@ def get_page_verification_state() -> Dict[str, Any]:
         // 2. Detect visible error banners, alerts, toasts
         const alerts = [];
         const alertElements = document.querySelectorAll(
-            '[role="alert"], [role="status"], [aria-live="assertive"], .alert, .error, .error-message, .invalid-feedback, .toast, .notice'
+            '[role="alert"], [role="status"], [aria-live="assertive"], .alert, .error, .error-message, .invalid-feedback, .toast, .notice, .alert-banner'
         );
         alertElements.forEach(el => {
             if (el.offsetParent !== null) { // visible only
@@ -94,20 +148,26 @@ def get_page_verification_state() -> Dict[str, Any]:
         // 3. Detect open modal dialogs
         const dialogs = [];
         document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], .modal.show').forEach(d => {
-            if (d.offsetParent !== null) {
+            const isNativeDialogOpen = d.tagName.toLowerCase() === 'dialog' && d.open;
+            const isVisibleAriaDialog = d.offsetParent !== null && window.getComputedStyle(d).display !== 'none';
+            if (isNativeDialogOpen || isVisibleAriaDialog) {
                 const titleEl = d.querySelector('h1, h2, h3, .modal-title, [id*="title"]');
-                const title = titleEl ? titleEl.innerText.trim() : 'Active Dialog';
+                const title = titleEl ? titleEl.innerText.trim() : (d.id || 'Active Dialog');
                 dialogs.push(title);
             }
         });
 
+        const bodyTxt = document.body ? document.body.innerText.trim() : '';
+
         return {
             url: window.location.href,
             title: document.title || 'Untitled',
-            bodyLength: document.body ? document.body.innerText.length : 0,
+            bodyText: bodyTxt.slice(0, 5000),
+            bodyLength: bodyTxt.length,
             invalidInputs: invalidInputs,
             alerts: alerts,
-            dialogs: dialogs
+            dialogs: dialogs,
+            error: null
         };
     })()
     """
@@ -118,45 +178,65 @@ def get_page_verification_state() -> Dict[str, Any]:
         return {
             "url": "unknown",
             "title": "unknown",
+            "bodyText": "",
             "bodyLength": 0,
             "invalidInputs": [],
             "alerts": [],
-            "dialogs": []
+            "dialogs": [],
+            "error": str(e)
         }
 
-def compare_page_states(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit_action: bool = False) -> Dict[str, Any]:
     """Analyzes differences between before and after states to determine outcome."""
+    if after.get("error"):
+        return {
+            "verdict": "INSPECTION_FAILED",
+            "error": after["error"],
+            "url_changed": False,
+            "all_invalid_inputs": [],
+            "new_invalid_inputs": [],
+            "all_alerts": [],
+            "new_alerts": [],
+            "active_dialogs": []
+        }
+
     url_changed = before.get("url") != after.get("url")
     title_changed = before.get("title") != after.get("title")
-    
-    # Check new invalid inputs
-    before_invalid_ids = {inp["name"] or inp["id"] or inp["label"] for inp in before.get("invalidInputs", [])}
+
+    # Detect new invalid inputs
+    before_invalid_keys = {f"{inp.get('name')}:{inp.get('id')}:{inp.get('label')}" for inp in before.get("invalidInputs", [])}
     new_invalids = [
         inp for inp in after.get("invalidInputs", [])
-        if (inp["name"] or inp["id"] or inp["label"]) not in before_invalid_ids
+        if f"{inp.get('name')}:{inp.get('id')}:{inp.get('label')}" not in before_invalid_keys
     ]
     all_current_invalids = after.get("invalidInputs", [])
 
-    # Check new alerts
+    # Detect new alerts
     before_alerts = set(before.get("alerts", []))
     new_alerts = [a for a in after.get("alerts", []) if a not in before_alerts]
 
-    # Check dialogs
+    # Detect dialogs
     before_dialogs = before.get("dialogs", [])
     after_dialogs = after.get("dialogs", [])
     dialog_opened = len(after_dialogs) > len(before_dialogs)
     dialog_closed = len(after_dialogs) < len(before_dialogs)
 
-    # Determine status verdict
-    if all_current_invalids or new_alerts:
-        verdict = "VALIDATION_ERROR"
-    elif url_changed:
+    # Detect content text change
+    content_changed = before.get("bodyText") != after.get("bodyText")
+
+    # Determine verdict safely without false positives from pre-existing background errors
+    if url_changed:
         verdict = "NAVIGATED"
+    elif new_invalids or new_alerts:
+        verdict = "VALIDATION_ERROR"
+    elif is_submit_action and all_current_invalids and not url_changed:
+        # User explicitly tried to submit, but form validation blocked navigation
+        verdict = "VALIDATION_ERROR"
     elif dialog_opened:
         verdict = "MODAL_OPENED"
     elif dialog_closed:
         verdict = "MODAL_CLOSED"
-    elif abs(after.get("bodyLength", 0) - before.get("bodyLength", 0)) > 5:
+    elif content_changed:
         verdict = "CONTENT_UPDATED"
     else:
         verdict = "NO_VISIBLE_CHANGE"
@@ -173,7 +253,8 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[s
         "all_alerts": after.get("alerts", []),
         "dialog_opened": dialog_opened,
         "dialog_closed": dialog_closed,
-        "active_dialogs": after_dialogs
+        "active_dialogs": after_dialogs,
+        "content_changed": content_changed
     }
 
 def print_verification_report(res: Dict[str, Any]):
@@ -188,14 +269,15 @@ def print_verification_report(res: Dict[str, Any]):
         print(f"   To   : {res['to_url']}")
     elif verdict == "VALIDATION_ERROR":
         print("❌ STATUS: FORM VALIDATION / SUBMISSION FAILED")
-        if res["all_invalid_inputs"]:
+        invalids = res["new_invalid_inputs"] if res["new_invalid_inputs"] else res["all_invalid_inputs"]
+        if invalids:
             print("\n   ⚠️  Invalid Fields Detected:")
-            for inp in res["all_invalid_inputs"]:
+            for inp in invalids:
                 name = inp["label"] or inp["name"] or inp["id"]
                 msg = inp["validationMessage"]
                 print(f"      • Field: \"{name}\" ({inp['tag']}) ➔ Error: \"{msg}\"")
-        if res["new_alerts"] or res["all_alerts"]:
-            alerts = res["new_alerts"] if res["new_alerts"] else res["all_alerts"]
+        alerts = res["new_alerts"] if res["new_alerts"] else res["all_alerts"]
+        if alerts:
             print("\n   🚨 Alert / Error Banners:")
             for a in alerts:
                 print(f"      • \"{a}\"")
@@ -206,6 +288,8 @@ def print_verification_report(res: Dict[str, Any]):
         print("ℹ️  STATUS: MODAL / DIALOG CLOSED")
     elif verdict == "CONTENT_UPDATED":
         print("✅ STATUS: IN-PAGE CONTENT UPDATED (DOM state changed)")
+    elif verdict == "INSPECTION_FAILED":
+        print(f"❌ STATUS: INSPECTION FAILED: {res.get('error')}")
     else:
         print("⚠️  STATUS: NO DETECTABLE CHANGE")
         print("   The action completed, but no URL, form, or visual change was observed.")
@@ -253,6 +337,11 @@ def tokenize(text: str) -> List[str]:
     return re.findall(r'\b[a-z0-9]+\b', text.lower())
 
 def compute_semantic_score(query: str, element: Dict[str, Any]) -> float:
+    """
+    Computes hybrid BM25 + Intent similarity score.
+    Includes safeguard: generic role tokens alone cannot match an element
+    if substantive descriptive query tokens were provided.
+    """
     q_tokens = tokenize(query)
     doc_tokens = tokenize(element["semantic_text"])
     if not q_tokens or not doc_tokens:
@@ -261,24 +350,49 @@ def compute_semantic_score(query: str, element: Dict[str, Any]) -> float:
     score = 0.0
     doc_text = " ".join(doc_tokens)
     name_text = element["name"].lower()
+    name_tokens = tokenize(name_text)
     role_text = element["role"].lower()
 
-    if query.lower() in name_text or query.lower() in doc_text:
+    # Distinguish between substantive query words and generic role keywords
+    substantive_q_tokens = [t for t in q_tokens if t not in GENERIC_ROLE_TOKENS]
+    has_substantive = len(substantive_q_tokens) > 0
+
+    substantive_matched = False
+
+    # Exact full match bonus
+    if query.strip().lower() == name_text:
+        score += 5.0
+        substantive_matched = True
+    elif query.strip().lower() in name_text:
         score += 3.0
+        substantive_matched = True
 
     for token in q_tokens:
+        is_substantive = token not in GENERIC_ROLE_TOKENS
+
         if token in doc_tokens:
             score += 1.5
-            if token in name_text:
+            if token in name_tokens:
                 score += 1.0
+                if is_substantive:
+                    substantive_matched = True
             if token == role_text:
+                # Structural role match bonus
                 score += 0.8
         else:
+            # Synonym lookup
             for base_word, synonyms in INTENT_SYNONYMS.items():
                 if token == base_word or token in synonyms:
-                    matched = [s for s in ([base_word] + synonyms) if s in doc_tokens]
+                    matched = [s for s in ([base_word] + synonyms) if s in name_tokens]
                     if matched:
-                        score += 0.9
+                        score += 1.2
+                        if is_substantive:
+                            substantive_matched = True
+
+    # If query had descriptive substantive tokens but NONE matched the element,
+    # reject match so generic role words (like 'button') don't falsely trigger
+    if has_substantive and not substantive_matched:
+        return 0.0
 
     if element["is_interactive"]:
         score *= 1.25
@@ -287,12 +401,16 @@ def compute_semantic_score(query: str, element: Dict[str, Any]) -> float:
     score *= length_penalty
     return round(score, 3)
 
-def resolve_target_element(target: str) -> Tuple[str, Dict[str, Any]]:
-    """Resolves whether target is a direct ref like 'e3' or a semantic search string."""
+def resolve_target_element(target: str, confidence_threshold: float = 1.0) -> Tuple[str, Dict[str, Any]]:
+    """
+    Resolves target query to element ref.
+    Guards against ambiguity when multiple elements have similar high scores.
+    """
     clean = target.strip().lstrip("@")
     snapshot = get_orca_snapshot()
     refs = snapshot.get("result", {}).get("refs", {})
 
+    # Direct ref check (e.g. 'e3')
     if clean in refs:
         return clean, refs[clean]
 
@@ -300,21 +418,40 @@ def resolve_target_element(target: str) -> Tuple[str, Dict[str, Any]]:
     scored = []
     for el in pruned:
         score = compute_semantic_score(target, el)
-        if score > 0:
+        if score >= confidence_threshold:
             scored.append((score, el))
 
     if not scored:
-        raise ValueError(f"Could not find any element matching query: '{target}'")
+        raise ElementNotFoundError(f"Could not find any element matching query: '{target}'")
 
     scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Ambiguity check: if top 2 candidates have distinct names and near-identical scores
+    if len(scored) >= 2:
+        top1_score, top1_el = scored[0]
+        top2_score, top2_el = scored[1]
+        score_diff = abs(top1_score - top2_score)
+
+        if score_diff < 0.15 and top1_el["name"].lower() != top2_el["name"].lower():
+            candidates = [f"[{el['ref']}] \"{el['name']}\" ({el['role']}) (score: {s})" for s, el in scored[:3] if abs(s - top1_score) < 0.15]
+            raise AmbiguousTargetError(
+                f"Query '{target}' is ambiguous between multiple elements:\n  • " +
+                "\n  • ".join(candidates) +
+                "\nPlease provide a more specific label or use the element ref directly."
+            )
+
     best = scored[0][1]
     return best["ref"], best
 
-def act_click_and_verify(target: str, wait_seconds: float = 1.0):
+def act_click_and_verify(target: str, wait_seconds: float = 1.0) -> Dict[str, Any]:
     print(f"\n🎯 Finding target element for click: '{target}'...")
     ref, info = resolve_target_element(target)
     name = info.get("name") or info.get("role")
-    print(f"👉 Matched element: [{ref}] \"{name}\"")
+    role = info.get("role", "")
+    print(f"👉 Matched element: [{ref}] \"{name}\" ({role})")
+
+    # Check if this is a submission action
+    is_submit = "submit" in target.lower() or "submit" in name.lower() or "save" in target.lower()
 
     before_state = get_page_verification_state()
     print(f"⚡ Executing: orca click --element {ref}")
@@ -324,11 +461,11 @@ def act_click_and_verify(target: str, wait_seconds: float = 1.0):
         time.sleep(wait_seconds)
 
     after_state = get_page_verification_state()
-    comparison = compare_page_states(before_state, after_state)
+    comparison = compare_page_states(before_state, after_state, is_submit_action=is_submit)
     print_verification_report(comparison)
     return comparison
 
-def act_fill_and_verify(target: str, value: str):
+def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
     print(f"\n🎯 Finding target field for fill: '{target}'...")
     ref, info = resolve_target_element(target)
     name = info.get("name") or info.get("role")
@@ -346,10 +483,10 @@ def act_fill_and_verify(target: str, value: str):
     print(" 🔎 INPUT VERIFICATION REPORT")
     print("=" * 70)
     print(f"✅ Filled element [{ref}] with: \"{value}\"")
-    if comparison["all_invalid_inputs"]:
-        matching_invalid = [i for i in comparison["all_invalid_inputs"] if i["label"] == name or i["id"] == ref]
+    if comparison.get("all_invalid_inputs"):
+        matching_invalid = [i for i in comparison["all_invalid_inputs"] if i.get("label") == name or i.get("id") == ref]
         if matching_invalid:
-            print(f"⚠️  Field has validation warning: {matching_invalid[0]['validationMessage']}")
+            print(f"⚠️  Field has validation warning: {matching_invalid[0].get('validationMessage')}")
         else:
             print("✅ Field validity: OK")
     else:
@@ -362,6 +499,13 @@ def check_errors_now():
     print("\n" + "=" * 70)
     print(" 🔎 CURRENT PAGE ERROR SCAN")
     print("=" * 70)
+
+    if state.get("error"):
+        print(f"❌ Error inspecting page: {state['error']}")
+        print("   Could not retrieve live DOM validity status.")
+        print("=" * 70)
+        sys.exit(1)
+
     print(f"📌 URL: {state['url']}")
 
     has_issues = False
@@ -394,11 +538,21 @@ def describe_current_page():
     buttons = [el for el in elements if el["is_button"]]
     links = [el for el in elements if el["is_link"]]
 
-    page_type = "Content / Information Page"
-    if "search" in state["url"].lower() or any("search" in el["name"].lower() for el in inputs):
+    # Improved page categorization
+    parsed_url = urlparse(state["url"])
+    is_search_page = (
+        parsed_url.path.startswith("/search")
+        or "q=" in parsed_url.query
+        or "query=" in parsed_url.query
+        or "google.com/search" in state["url"]
+    )
+
+    if is_search_page:
         page_type = "Search Results / Search Engine Page"
-    elif len(inputs) >= 3:
+    elif len(inputs) >= 2 or any("form" in state["url"].lower() for _ in [1]):
         page_type = "Interactive Form / Data-Entry Page"
+    else:
+        page_type = "Content / Information Page"
 
     print("=" * 75)
     print(" 📄 ORCA BROWSER PAGE DESCRIPTION")
@@ -438,7 +592,7 @@ def search_elements(query: str, top_k: int = 5):
     for el in pruned:
         score = compute_semantic_score(query, el)
         if score > 0:
-            scored.append({**el, "score": score})
+            scored.append((score, el))
 
     scored.sort(key=lambda x: x["score"], reverse=True)
 
@@ -450,6 +604,15 @@ def search_elements(query: str, top_k: int = 5):
     if not scored:
         print("❌ No matching elements found.")
         return
+
+    # Check ambiguity among top candidates
+    if len(scored) >= 2:
+        diff = abs(scored[0][0] - scored[1][0])
+        if diff < 0.15 and scored[0][1]["name"].lower() != scored[1][1]["name"].lower():
+            print(f"⚠️  NOTE: Ambiguous match detected between multiple elements:")
+            for s, el in scored[:2]:
+                print(f"   • [{el['ref']}] \"{el['name']}\" (Score: {s})")
+            print("-" * 70)
 
     for i, res in enumerate(scored[:top_k], 1):
         ref = res["ref"]
@@ -467,26 +630,42 @@ def search_elements(query: str, top_k: int = 5):
         print("-" * 70)
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1].lower() in ["--describe", "describe", "-d", "info"]:
-        describe_current_page()
-    elif sys.argv[1].lower() in ["--check-errors", "errors", "check"]:
-        check_errors_now()
-    elif sys.argv[1].lower() in ["--click", "-c"]:
-        if len(sys.argv) < 3:
-            print("Usage: python3 orca_smart_search.py --click <query_or_ref>")
-            sys.exit(1)
-        target = " ".join(sys.argv[2:])
-        act_click_and_verify(target)
-    elif sys.argv[1].lower() in ["--fill", "-f"]:
-        if len(sys.argv) < 4:
-            print("Usage: python3 orca_smart_search.py --fill <query_or_ref> <value>")
-            sys.exit(1)
-        target = sys.argv[2]
-        value = " ".join(sys.argv[3:])
-        act_fill_and_verify(target, value)
-    else:
-        query = " ".join(sys.argv[1:])
-        search_elements(query, top_k=5)
+    try:
+        if len(sys.argv) < 2 or sys.argv[1].lower() in ["--describe", "describe", "-d", "info"]:
+            describe_current_page()
+        elif sys.argv[1].lower() in ["--check-errors", "errors", "check"]:
+            check_errors_now()
+        elif sys.argv[1].lower() in ["--click", "-c"]:
+            if len(sys.argv) < 3:
+                print("Usage: python3 orca_smart_search.py --click <query_or_ref>")
+                sys.exit(1)
+            target = " ".join(sys.argv[2:])
+            act_click_and_verify(target)
+        elif sys.argv[1].lower() in ["--fill", "-f"]:
+            if len(sys.argv) < 4:
+                print("Usage: python3 orca_smart_search.py --fill <query_or_ref> <value>")
+                sys.exit(1)
+            target = sys.argv[2]
+            value = " ".join(sys.argv[3:])
+            act_fill_and_verify(target, value)
+        else:
+            query = " ".join(sys.argv[1:])
+            search_elements(query, top_k=5)
+    except AmbiguousTargetError as e:
+        print(f"\n⚠️  AMBIGUITY ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
+    except ElementNotFoundError as e:
+        print(f"\n❌ NOT FOUND: {e}", file=sys.stderr)
+        sys.exit(3)
+    except OrcaNotFoundError as e:
+        print(f"\n❌ ORCA CLI ERROR: {e}", file=sys.stderr)
+        sys.exit(4)
+    except OrcaError as e:
+        print(f"\n❌ ORCA ERROR: {e}", file=sys.stderr)
+        sys.exit(5)
+    except Exception as e:
+        print(f"\n❌ UNEXPECTED ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
