@@ -449,9 +449,13 @@ def parse_date_value(val: str) -> Optional[str]:
 
     return None
 
-def extract_ancestor_contexts(snapshot_text: str) -> Dict[str, str]:
+def extract_snapshot_metadata(snapshot_text: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, bool]]:
     ref_contexts = {}
+    ref_values = {}
+    ref_disabled = {}
     stack = []
+    last_label = ""
+
     for line in snapshot_text.splitlines():
         if not line.strip():
             continue
@@ -461,27 +465,40 @@ def extract_ancestor_contexts(snapshot_text: str) -> Dict[str, str]:
 
         m_label = re.search(r'([A-Za-z]+)\s+"([^"]+)"', line)
         current_label = m_label.group(2) if m_label else ""
+        if current_label and ("StaticText" in line or "Label" in line):
+            last_label = current_label
 
-        m_ref = re.search(r'\[(?:[^\]]*ref=)?(e\d+)\]', line)
+        m_ref = re.search(r'\[(?:[^\]]*ref=)?(e\d+)\](?::\s*(.+))?', line)
         if m_ref:
             ref_id = m_ref.group(1)
+            val = m_ref.group(2)
+            if val:
+                ref_values[ref_id] = val.strip()
+            if "disabled" in line.split("]")[0]:
+                ref_disabled[ref_id] = True
             ancestors = [item[1] for item in stack if item[1]]
-            ref_contexts[ref_id] = " ".join(ancestors)
+            context = " ".join(ancestors) if ancestors else last_label
+            ref_contexts[ref_id] = context
 
         if current_label:
             stack.append((indent, current_label))
-    return ref_contexts
+
+    return ref_contexts, ref_values, ref_disabled
 
 def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = snapshot_data.get("result", {})
     refs = result.get("refs", {})
     snapshot_text = result.get("snapshot", "")
-    ancestor_contexts = extract_ancestor_contexts(snapshot_text) if snapshot_text else {}
+    ref_contexts, ref_values, ref_disabled = extract_snapshot_metadata(snapshot_text) if snapshot_text else ({}, {}, {})
     pruned = []
 
     for ref_id, info in refs.items():
         role = info.get("role", "").lower()
         name = info.get("name", "").strip()
+
+        # If name is empty, recover label from snapshot text (e.g. ": Select Year")
+        if not name and ref_id in ref_values:
+            name = ref_values[ref_id]
 
         if role in ["generic", "none", "presentation"] and not name:
             continue
@@ -490,13 +507,18 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         is_button = role in ["button", "menuitem", "switch"]
         is_link = role == "link"
 
-        context = ancestor_contexts.get(ref_id, "")
-        if context and context.lower() not in name.lower():
+        inline_val = ref_values.get(ref_id, "")
+        context = ref_contexts.get(ref_id, "")
+
+        if inline_val and inline_val.lower() not in name.lower():
+            display_name = f"{name} ({inline_val})".strip()
+            semantic_text = f"{context} {name} {inline_val} {role}".strip()
+        elif context and context.lower() not in name.lower():
             display_name = f"{context} {name}".strip()
+            semantic_text = f"{context} {name} {role}".strip()
         else:
             display_name = name
-
-        semantic_text = f"{context} {name} {role}".strip()
+            semantic_text = f"{context} {name} {role}".strip()
         if not semantic_text:
             continue
 
@@ -508,6 +530,7 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "name": display_name,
             "raw_name": name,
             "context": context,
+            "disabled": ref_disabled.get(ref_id, False),
             "is_input": is_input,
             "is_button": is_button,
             "is_link": is_link,
@@ -741,9 +764,20 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                 let l = '';
                 if (s.labels && s.labels[0]) l = s.labels[0].innerText;
                 else if (s.parentElement && s.parentElement.previousElementSibling) l = s.parentElement.previousElementSibling.innerText;
-                const text = (l + ' ' + s.name + ' ' + (s.options[0]?.text || '')).toLowerCase();
+                const text = (l + ' ' + (s.id || '') + ' ' + (s.name || '') + ' ' + (s.options[0]?.text || '')).toLowerCase();
                 let score = 0;
-                words.forEach(w => {{ if (text.includes(w)) score++; }});
+                words.forEach(w => {{
+                    if (text.includes(w)) {{
+                        if (['year', 'month', 'day', 'date'].includes(w)) score += 3;
+                        else score += 1;
+                    }}
+                }});
+
+                const exactTextMatch = Array.from(s.options).some(o => o.text.trim().toLowerCase() === desired);
+                const valueMatch = Array.from(s.options).some(o => o.value.trim().toLowerCase() === desired);
+                if (exactTextMatch) score += 10;
+                else if (valueMatch) score += 3;
+
                 if (score > bestScore) {{
                     bestScore = score;
                     bestSelect = s;
@@ -753,12 +787,14 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
             if (bestSelect) {{
                 bestSelect.scrollIntoView({{block: 'center'}});
                 const opt = Array.from(bestSelect.options).find(o => 
-                    o.text.trim().toLowerCase() === desired ||
-                    o.text.trim().toLowerCase().startsWith(desired) ||
-                    o.value.trim().toLowerCase() === desired
+                    o.text.trim().toLowerCase() === desired
+                ) || Array.from(bestSelect.options).find(o => 
+                    o.value.trim().toLowerCase() === desired ||
+                    o.text.trim().toLowerCase().startsWith(desired)
                 );
                 if (opt) {{
                     bestSelect.value = opt.value;
+                    bestSelect.dispatchEvent(new Event('input', {{bubbles: true}}));
                     bestSelect.dispatchEvent(new Event('change', {{bubbles: true}}));
                     return 'select_set:' + opt.text;
                 }}
