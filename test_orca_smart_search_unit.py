@@ -273,5 +273,16 @@ class TestNewFeatures(unittest.TestCase):
         mock_check.assert_any_call("I agree", "check")
         mock_check.assert_any_call("Opt out", "uncheck")
 
+    def test_option_unavailable_error(self):
+        err = oss.OptionUnavailableError("Option '2001' not in [2026, 2027]")
+        self.assertIsInstance(err, oss.OrcaError)
+
+    @patch("orca_smart_search.resolve_target_element")
+    def test_click_disabled_element_raises_element_disabled_error(self, mock_resolve):
+        mock_resolve.return_value = ("e100", {"name": "Previous year", "role": "button", "disabled": True})
+        with self.assertRaises(oss.ElementDisabledError) as ctx:
+            oss.act_click_and_verify("Previous year")
+        self.assertIn("disabled", str(ctx.exception))
+
 if __name__ == "__main__":
     unittest.main()

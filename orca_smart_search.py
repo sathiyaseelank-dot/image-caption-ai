@@ -64,6 +64,14 @@ class ElementNotFoundError(OrcaError):
     """Raised when no element matches the query."""
     pass
 
+class OptionUnavailableError(OrcaError):
+    """Raised when a requested option is not available in a dropdown / select element."""
+    pass
+
+class ElementDisabledError(OrcaError):
+    """Raised when attempting to interact with a disabled element."""
+    pass
+
 def run_cmd(args: List[str], timeout: float = 15.0) -> str:
     """Executes an Orca CLI command with proper error handling and timeout."""
     if not os.path.exists(ORCA_BIN):
@@ -682,6 +690,10 @@ def act_click_and_verify(target: str, wait_seconds: float = 1.0) -> Dict[str, An
     role = info.get("role", "")
     print(f"👉 Matched element: [{ref}] \"{name}\" ({role})")
 
+    if info.get("disabled"):
+        print(f"\n⚠️  ELEMENT DISABLED: Element [{ref}] \"{name}\" ({role}) is currently disabled on this page.")
+        raise ElementDisabledError(f"Cannot click '{target}' because element [{ref}] is disabled on the page.")
+
     # Check if this is a submission action
     is_submit = "submit" in target.lower() or "submit" in name.lower() or "save" in target.lower()
 
@@ -794,7 +806,8 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                 let l = '';
                 if (s.labels && s.labels[0]) l = s.labels[0].innerText;
                 else if (s.parentElement && s.parentElement.previousElementSibling) l = s.parentElement.previousElementSibling.innerText;
-                const text = (l + ' ' + (s.id || '') + ' ' + (s.name || '') + ' ' + (s.options[0]?.text || '')).toLowerCase();
+                const ariaLabel = (s.getAttribute('aria-label') || '').toLowerCase();
+                const text = (l + ' ' + (s.id || '') + ' ' + (s.className || '') + ' ' + (s.name || '') + ' ' + ariaLabel + ' ' + (s.options[0]?.text || '')).toLowerCase();
                 let score = 0;
                 words.forEach(w => {{
                     if (text.includes(w)) {{
@@ -803,8 +816,12 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                     }}
                 }});
 
-                const exactTextMatch = Array.from(s.options).some(o => o.text.trim().toLowerCase() === desired);
-                const valueMatch = Array.from(s.options).some(o => o.value.trim().toLowerCase() === desired);
+                if (ariaLabel && (target.includes(ariaLabel) || ariaLabel.includes(target))) {{
+                    score += 10;
+                }}
+
+                const exactTextMatch = Array.from(s.options).some(o => (o.text || '').trim().toLowerCase() === desired);
+                const valueMatch = Array.from(s.options).some(o => (o.value || '').trim().toLowerCase() === desired);
                 if (exactTextMatch) score += 10;
                 else if (valueMatch) score += 3;
 
@@ -816,6 +833,7 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
 
             if (bestSelect) {{
                 bestSelect.scrollIntoView({{block: 'center'}});
+                const allOpts = Array.from(bestSelect.options).map(o => (o.text || o.value || '').trim()).filter(Boolean);
                 const opt = Array.from(bestSelect.options).find(o => 
                     o.text.trim().toLowerCase() === desired
                 ) || Array.from(bestSelect.options).find(o => 
@@ -826,20 +844,44 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                     bestSelect.value = opt.value;
                     bestSelect.dispatchEvent(new Event('input', {{bubbles: true}}));
                     bestSelect.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return 'select_set:' + opt.text;
+                    return JSON.stringify({{
+                        status: 'selected',
+                        selected: opt.text,
+                        value: opt.value
+                    }});
+                }} else {{
+                    return JSON.stringify({{
+                        status: 'unavailable',
+                        requested: desiredVal,
+                        available: allOpts.slice(0, 15),
+                        total: allOpts.length
+                    }});
                 }}
             }}
-            return 'standard';
+            return JSON.stringify({{ status: 'standard' }});
         }})()
         """
         try:
-            res = run_cmd([ORCA_BIN, "eval", "--expression", select_js])
-            if "select_set:" in res:
-                selected_text = res.split("select_set:")[1]
+            res_raw = run_cmd([ORCA_BIN, "eval", "--expression", select_js])
+            select_data = json.loads(res_raw)
+            if select_data.get("status") == "selected":
+                selected_text = select_data.get("selected")
                 print(f"⚡ Selected dropdown option: \"{selected_text}\"")
+                actual_filled_val = selected_text
+            elif select_data.get("status") == "unavailable":
+                avail = select_data.get("available", [])
+                avail_str = ", ".join(avail[:10]) + ("..." if select_data.get("total", 0) > 10 else "")
+                print(f"\n❌ OPTION UNAVAILABLE: Option \"{value}\" is not available for \"{name}\".")
+                print(f"   Available options ({select_data.get('total')}): [{avail_str}]")
+                raise OptionUnavailableError(
+                    f"Option '{value}' is not available in dropdown '{name}'. "
+                    f"Available options are: [{avail_str}]"
+                )
             else:
                 print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
                 run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
+        except OptionUnavailableError:
+            raise
         except Exception:
             print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
             run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
@@ -1347,6 +1389,12 @@ def main():
         else:
             query = " ".join(sys.argv[1:])
             search_elements(query, top_k=5)
+    except OptionUnavailableError as e:
+        print(f"\n❌ OPTION UNAVAILABLE: {e}", file=sys.stderr)
+        sys.exit(6)
+    except ElementDisabledError as e:
+        print(f"\n⚠️  ELEMENT DISABLED: {e}", file=sys.stderr)
+        sys.exit(7)
     except AmbiguousTargetError as e:
         print(f"\n⚠️  AMBIGUITY ERROR: {e}", file=sys.stderr)
         sys.exit(2)
