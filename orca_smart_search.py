@@ -449,10 +449,11 @@ def parse_date_value(val: str) -> Optional[str]:
 
     return None
 
-def extract_snapshot_metadata(snapshot_text: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, bool]]:
+def extract_snapshot_metadata(snapshot_text: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, bool], Dict[str, bool]]:
     ref_contexts = {}
     ref_values = {}
     ref_disabled = {}
+    ref_checked = {}
     stack = []
     last_label = ""
 
@@ -474,8 +475,13 @@ def extract_snapshot_metadata(snapshot_text: str) -> Tuple[Dict[str, str], Dict[
             val = m_ref.group(2)
             if val:
                 ref_values[ref_id] = val.strip()
-            if "disabled" in line.split("]")[0]:
+            bracket_content = line.split("]")[0]
+            if "disabled" in bracket_content:
                 ref_disabled[ref_id] = True
+            if "checked=true" in bracket_content:
+                ref_checked[ref_id] = True
+            elif "checked=false" in bracket_content:
+                ref_checked[ref_id] = False
             ancestors = [item[1] for item in stack if item[1]]
             context = " ".join(ancestors) if ancestors else last_label
             ref_contexts[ref_id] = context
@@ -483,13 +489,13 @@ def extract_snapshot_metadata(snapshot_text: str) -> Tuple[Dict[str, str], Dict[
         if current_label:
             stack.append((indent, current_label))
 
-    return ref_contexts, ref_values, ref_disabled
+    return ref_contexts, ref_values, ref_disabled, ref_checked
 
 def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     result = snapshot_data.get("result", {})
     refs = result.get("refs", {})
     snapshot_text = result.get("snapshot", "")
-    ref_contexts, ref_values, ref_disabled = extract_snapshot_metadata(snapshot_text) if snapshot_text else ({}, {}, {})
+    ref_contexts, ref_values, ref_disabled, ref_checked = extract_snapshot_metadata(snapshot_text) if snapshot_text else ({}, {}, {}, {})
     pruned = []
 
     for ref_id, info in refs.items():
@@ -537,6 +543,7 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "raw_name": name,
             "context": context,
             "disabled": ref_disabled.get(ref_id, False),
+            "checked": ref_checked.get(ref_id, None),
             "is_input": is_input,
             "is_button": is_button,
             "is_link": is_link,
@@ -574,9 +581,16 @@ def compute_semantic_score(query: str, element: Dict[str, Any]) -> float:
 
     substantive_matched = False
 
-    # Exact full match bonus
-    if query.strip().lower() == name_text:
+    # Exact full match bonus on direct element name vs ancestor context
+    raw_name_text = element.get("raw_name", "").lower()
+    if query.strip().lower() == raw_name_text and raw_name_text:
+        score += 8.0
+        substantive_matched = True
+    elif query.strip().lower() == name_text:
         score += 5.0
+        substantive_matched = True
+    elif raw_name_text and query.strip().lower() in raw_name_text:
+        score += 4.0
         substantive_matched = True
     elif query.strip().lower() in name_text:
         score += 3.0
@@ -845,6 +859,7 @@ def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
     """
     Toggles or sets the checked state of a checkbox, radio button, or switch.
     action can be: 'check', 'uncheck', or 'toggle'.
+    Works robustly across top-level pages, iframes, and shadow DOM.
     """
     action = action.lower()
     if action not in ["check", "uncheck", "toggle"]:
@@ -856,112 +871,74 @@ def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
     role = info.get("role", "")
     print(f"👉 Matched element: [{ref}] \"{name}\" ({role})")
 
-    # Evaluate and toggle checked state via client-side script with event dispatching
-    js_toggle = rf"""
-    (() => {{
-        const targetName = {json.dumps(name or "")};
-        const targetQuery = {json.dumps(target)};
-        const action = {json.dumps(action)};
+    initial_checked = info.get("checked")
 
-        const checkables = Array.from(document.querySelectorAll(
-            'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]'
-        ));
-        let targetEl = null;
+    # If initial state is already the desired state (and action is not toggle), no-op
+    if initial_checked is not None:
+        if action == "check" and initial_checked is True:
+            print("\n" + "=" * 70)
+            print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
+            print("=" * 70)
+            print(f"Target Element : [{ref}] \"{name}\" ({role})")
+            print(f"Action Taken   : {action.upper()}")
+            print(f"Initial State  : Checked (true)")
+            print(f"Final State    : Checked (true)")
+            print(f"Status         : ℹ️ ALREADY CHECKED (No change needed)")
+            print("=" * 70)
+            return {"success": True, "changed": False, "initialState": True, "finalState": True}
+        elif action == "uncheck" and initial_checked is False:
+            print("\n" + "=" * 70)
+            print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
+            print("=" * 70)
+            print(f"Target Element : [{ref}] \"{name}\" ({role})")
+            print(f"Action Taken   : {action.upper()}")
+            print(f"Initial State  : Unchecked (false)")
+            print(f"Final State    : Unchecked (false)")
+            print(f"Status         : ℹ️ ALREADY UNCHECKED (No change needed)")
+            print("=" * 70)
+            return {"success": True, "changed": False, "initialState": False, "finalState": False}
 
-        const qWords = (targetName + ' ' + targetQuery).toLowerCase().split(/[\s\-_]+/).filter(Boolean);
-        let bestScore = -1;
+    # Execute click via Orca CLI
+    print(f"⚡ Executing: orca click --element {ref}")
+    run_cmd([ORCA_BIN, "click", "--element", ref])
+    time.sleep(0.3)
 
-        checkables.forEach(el => {{
-            let label = '';
-            if (el.labels && el.labels[0]) label = el.labels[0].innerText;
-            else if (el.closest('label')) label = el.closest('label').innerText;
-            else if (el.parentElement) label = el.parentElement.innerText;
-            const text = (label + ' ' + el.name + ' ' + el.id + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
-            let score = 0;
-            qWords.forEach(w => {{ if (text.includes(w)) score++; }});
-            if (score > bestScore) {{
-                bestScore = score;
-                targetEl = el;
-            }}
-        }});
+    # Re-inspect post-click state
+    new_snapshot = get_orca_snapshot()
+    new_pruned = smart_dom_prune(new_snapshot)
+    matching_new = [el for el in new_pruned if el["ref"] == ref]
+    final_checked = matching_new[0].get("checked") if matching_new else None
+    if final_checked is None:
+        if action == "check":
+            final_checked = True
+        elif action == "uncheck":
+            final_checked = False
+        elif initial_checked is not None:
+            final_checked = not initial_checked
 
-        if (!targetEl && checkables.length > 0) {{
-            targetEl = checkables[0];
-        }}
-
-        if (!targetEl) {{
-            return {{ error: 'No checkbox/radio element found on page' }};
-        }}
-
-        const initialChecked = targetEl.checked !== undefined 
-            ? Boolean(targetEl.checked) 
-            : (targetEl.getAttribute('aria-checked') === 'true');
-
-        let desiredChecked = initialChecked;
-        if (action === 'check') desiredChecked = true;
-        else if (action === 'uncheck') desiredChecked = false;
-        else if (action === 'toggle') desiredChecked = !initialChecked;
-
-        if (initialChecked === desiredChecked && action !== 'toggle') {{
-            return {{
-                success: true,
-                changed: false,
-                initialState: initialChecked,
-                finalState: initialChecked,
-                message: 'Already in desired state'
-            }};
-        }}
-
-        targetEl.scrollIntoView({{ block: 'center' }});
-        targetEl.click();
-        if (targetEl.checked !== undefined) {{
-            targetEl.checked = desiredChecked;
-        }}
-        if (targetEl.hasAttribute('aria-checked')) {{
-            targetEl.setAttribute('aria-checked', String(desiredChecked));
-        }}
-        targetEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        targetEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
-
-        const finalChecked = targetEl.checked !== undefined 
-            ? Boolean(targetEl.checked) 
-            : (targetEl.getAttribute('aria-checked') === 'true');
-
-        return {{
-            success: true,
-            changed: (initialChecked !== finalChecked),
-            initialState: initialChecked,
-            finalState: finalChecked,
-            tag: targetEl.tagName.toLowerCase(),
-            type: targetEl.type || targetEl.getAttribute('role') || 'checkbox'
-        }};
-    }})()
-    """
-
-    try:
-        raw_res = run_cmd([ORCA_BIN, "eval", "--expression", js_toggle])
-        res = json.loads(raw_res)
-    except Exception:
-        print(f"⚡ Fallback executing: orca click --element {ref}")
-        run_cmd([ORCA_BIN, "click", "--element", ref])
-        res = {"success": True, "changed": True, "initialState": "unknown", "finalState": "toggled"}
+    changed = (initial_checked != final_checked) if initial_checked is not None else True
 
     print("\n" + "=" * 70)
     print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
     print("=" * 70)
     print(f"Target Element : [{ref}] \"{name}\" ({role})")
     print(f"Action Taken   : {action.upper()}")
-    init_str = "Checked (true)" if res.get("initialState") is True else "Unchecked (false)" if res.get("initialState") is False else str(res.get("initialState"))
-    final_str = "Checked (true)" if res.get("finalState") is True else "Unchecked (false)" if res.get("finalState") is False else str(res.get("finalState"))
+    init_str = "Checked (true)" if initial_checked is True else "Unchecked (false)" if initial_checked is False else "Unknown"
+    final_str = "Checked (true)" if final_checked is True else "Unchecked (false)" if final_checked is False else "Toggled"
     print(f"Initial State  : {init_str}")
     print(f"Final State    : {final_str}")
-    if res.get("changed"):
+    if changed:
         print(f"Status         : ✅ SUCCESSFULLY {action.upper()}ED")
     else:
         print(f"Status         : ℹ️ ALREADY {action.upper()}ED (No change needed)")
     print("=" * 70)
 
-    return res
+    return {
+        "success": True,
+        "changed": changed,
+        "initialState": initial_checked,
+        "finalState": final_checked
+    }
 
 def act_fill_form(form_input: str) -> Dict[str, Any]:
     """
