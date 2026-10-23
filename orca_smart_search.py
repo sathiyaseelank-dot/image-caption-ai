@@ -776,7 +776,16 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
             const target = targetName.toLowerCase();
             const desired = desiredVal.toLowerCase();
             const words = target.split(/[\s\-_]+/).filter(Boolean);
-            const selects = Array.from(document.querySelectorAll('select'));
+            const selects = [];
+            try {{
+                selects.push(...Array.from(document.querySelectorAll('select')));
+                document.querySelectorAll('iframe').forEach(f => {{
+                    try {{
+                        const idoc = f.contentDocument || f.contentWindow.document;
+                        if (idoc) selects.push(...Array.from(idoc.querySelectorAll('select')));
+                    }} catch(e) {{}}
+                }});
+            }} catch(e) {{}}
             
             let bestSelect = null;
             let bestScore = -1;
