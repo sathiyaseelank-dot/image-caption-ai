@@ -18,8 +18,23 @@ import subprocess
 import re
 import time
 import hashlib
+import base64
+import datetime
+import builtins
 from urllib.parse import urlparse, parse_qs
 from typing import List, Dict, Any, Optional, Tuple
+
+_builtin_print = builtins.print
+IS_JSON_MODE = False
+
+def print_log(*args, **kwargs):
+    if not IS_JSON_MODE:
+        _builtin_print(*args, **kwargs)
+
+print = print_log
+
+def emit_json(data: Dict[str, Any]):
+    _builtin_print(json.dumps(data, indent=2))
 
 ORCA_BIN = os.environ.get("ORCA_BIN", "/home/inkyank-01/.config/orca/linux-orca-cli-shim/orca")
 
@@ -58,19 +73,29 @@ class OrcaNotFoundError(OrcaError):
 
 class AmbiguousTargetError(OrcaError):
     """Raised when a semantic query matches multiple elements with similar confidence."""
-    pass
+    def __init__(self, message: str, candidates: Optional[List[Any]] = None):
+        super().__init__(message)
+        self.candidates = candidates or []
 
 class ElementNotFoundError(OrcaError):
     """Raised when no element matches the query."""
-    pass
+    def __init__(self, message: str, target: Optional[str] = None):
+        super().__init__(message)
+        self.target = target
 
 class OptionUnavailableError(OrcaError):
     """Raised when a requested option is not available in a dropdown / select element."""
-    pass
+    def __init__(self, message: str, available_options: Optional[List[str]] = None, target: Optional[str] = None, element: Optional[str] = None):
+        super().__init__(message)
+        self.available_options = available_options or []
+        self.target = target
+        self.element = element
 
 class ElementDisabledError(OrcaError):
     """Raised when attempting to interact with a disabled element."""
-    pass
+    def __init__(self, message: str, target: Optional[str] = None):
+        super().__init__(message)
+        self.target = target
 
 def run_cmd(args: List[str], timeout: float = 15.0) -> str:
     """Executes an Orca CLI command with proper error handling and timeout."""
@@ -659,7 +684,7 @@ def resolve_target_element(target: str, confidence_threshold: float = 1.0) -> Tu
             scored.append((score, el))
 
     if not scored:
-        raise ElementNotFoundError(f"Could not find any element matching query: '{target}'")
+        raise ElementNotFoundError(f"Could not find any element matching query: '{target}'", target=target)
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -677,7 +702,8 @@ def resolve_target_element(target: str, confidence_threshold: float = 1.0) -> Tu
                 raise AmbiguousTargetError(
                     f"Query '{target}' is ambiguous between multiple elements:\n  • " +
                     "\n  • ".join(candidates) +
-                    "\nPlease provide a more specific label or use the element ref directly."
+                    "\nPlease provide a more specific label or use the element ref directly.",
+                    candidates=candidates
                 )
 
     best = scored[0][1]
@@ -692,7 +718,7 @@ def act_click_and_verify(target: str, wait_seconds: float = 1.0) -> Dict[str, An
 
     if info.get("disabled"):
         print(f"\n⚠️  ELEMENT DISABLED: Element [{ref}] \"{name}\" ({role}) is currently disabled on this page.")
-        raise ElementDisabledError(f"Cannot click '{target}' because element [{ref}] is disabled on the page.")
+        raise ElementDisabledError(f"Cannot click '{target}' because element [{ref}] is disabled on the page.", target=target)
 
     # Check if this is a submission action
     is_submit = "submit" in target.lower() or "submit" in name.lower() or "save" in target.lower()
@@ -875,7 +901,10 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                 print(f"   Available options ({select_data.get('total')}): [{avail_str}]")
                 raise OptionUnavailableError(
                     f"Option '{value}' is not available in dropdown '{name}'. "
-                    f"Available options are: [{avail_str}]"
+                    f"Available options are: [{avail_str}]",
+                    available_options=avail,
+                    target=value,
+                    element=name
                 )
             else:
                 print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
@@ -1185,7 +1214,148 @@ def act_wait_for(target: str, timeout: float = 10.0, poll_interval: float = 0.5,
         "spinner_seen": spinner_seen
     }
 
-def check_errors_now():
+def act_keypress(key: str, target: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Sends a keyboard keypress event to the browser.
+    If target is provided, finds the target element, checks if disabled,
+    scrolls it into view, and focuses it before sending the keypress.
+    Also performs pre- and post-action state verification.
+    """
+    ref = None
+    info = None
+    if target:
+        print(f"\n🎯 Finding target element for keypress '{key}': '{target}'...")
+        ref, info = resolve_target_element(target)
+        name = info.get("name") or info.get("role")
+        role = info.get("role", "")
+        print(f"👉 Matched element: [{ref}] \"{name}\" ({role})")
+
+        if info.get("disabled"):
+            print(f"\n⚠️  ELEMENT DISABLED: Element [{ref}] \"{name}\" ({role}) is currently disabled on this page.")
+            raise ElementDisabledError(f"Cannot press key '{key}' on '{target}' because element [{ref}] is disabled.", target=target)
+
+        # Focus target element via JavaScript
+        focus_js = f"""
+        (() => {{
+            const target = {json.dumps(name)};
+            const candidates = Array.from(document.querySelectorAll('button, input, a, select, textarea, [role=button], [role=combobox], [tabindex]'));
+            const match = candidates.find(el => {{
+                const txt = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                return txt === target.toLowerCase() || txt.includes(target.toLowerCase());
+            }});
+            if (match) {{
+                match.scrollIntoView({{block: 'center', inline: 'center'}});
+                match.focus();
+                return true;
+            }}
+            return false;
+        }})()
+        """
+        try:
+            run_cmd([ORCA_BIN, "eval", "--expression", focus_js])
+        except Exception:
+            pass
+
+    pre_state = get_page_verification_state()
+
+    print(f"⚡ Executing: orca keypress --key {key}")
+    run_cmd([ORCA_BIN, "keypress", "--key", key])
+    time.sleep(0.3)
+
+    post_state = get_page_verification_state()
+    comparison = compare_page_states(pre_state, post_state)
+
+    print("\n" + "=" * 70)
+    print(" ⌨️  KEYPRESS ACTION REPORT")
+    print("=" * 70)
+    print(f"Key Pressed    : {key}")
+    if target and info:
+        print(f"Target Element : [{ref}] \"{info.get('name')}\" ({info.get('role')})")
+    else:
+        print(f"Target Element : (Active Browser Focus)")
+    print(f"Status         : ✅ KEYPRESS DISPATCHED")
+    print(f"Action Outcome : {comparison.get('change_type')}")
+    if comparison.get("details"):
+        print(f"Details        : {comparison.get('details')}")
+    print("=" * 70)
+
+    return {
+        "success": True,
+        "key": key,
+        "target": target,
+        "target_ref": ref,
+        "target_name": info.get("name") if info else None,
+        "comparison": comparison
+    }
+
+def act_screenshot(output_path: Optional[str] = None, format: str = "png") -> Dict[str, Any]:
+    """
+    Captures a viewport screenshot of the active browser tab via Orca CLI,
+    decodes the base64 payload, and saves it to a file.
+    """
+    format = format.lower()
+    if format not in ["png", "jpeg", "jpg"]:
+        format = "png"
+    if format == "jpg":
+        format = "jpeg"
+
+    now = datetime.datetime.now()
+    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+    timestamp_iso = now.isoformat()
+
+    if not output_path:
+        out_dir = os.path.join(os.getcwd(), "screenshots")
+        os.makedirs(out_dir, exist_ok=True)
+        ext = "jpg" if format == "jpeg" else "png"
+        output_path = os.path.join(out_dir, f"screenshot_{timestamp_str}.{ext}")
+    else:
+        parent = os.path.dirname(os.path.abspath(output_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+    print(f"\n📸 Capturing {format.upper()} screenshot via Orca CLI...")
+    raw = run_cmd([ORCA_BIN, "screenshot", "--format", format, "--json"])
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise OrcaError(f"Failed to parse screenshot JSON output: {e}")
+
+    result = data.get("result", {})
+    b64_data = result.get("data")
+    if not b64_data:
+        raise OrcaError(f"Orca screenshot response missing image data: {raw[:200]}")
+
+    try:
+        img_bytes = base64.b64decode(b64_data)
+    except Exception as e:
+        raise OrcaError(f"Failed to decode base64 screenshot data: {e}")
+
+    with open(output_path, "wb") as f:
+        f.write(img_bytes)
+
+    size_bytes = len(img_bytes)
+    size_kb = round(size_bytes / 1024, 1)
+    abs_path = os.path.abspath(output_path)
+
+    print("\n" + "=" * 70)
+    print(" 📸 VIEWPORT SCREENSHOT CAPTURED")
+    print("=" * 70)
+    print(f"File Path      : {abs_path}")
+    print(f"Image Format   : {format.upper()}")
+    print(f"File Size      : {size_bytes} bytes ({size_kb} KB)")
+    print(f"Timestamp      : {timestamp_iso}")
+    print("=" * 70)
+
+    return {
+        "success": True,
+        "path": abs_path,
+        "format": format,
+        "size_bytes": size_bytes,
+        "timestamp": timestamp_iso
+    }
+
+def check_errors_now() -> Dict[str, Any]:
     state = get_page_verification_state()
     print("\n" + "=" * 70)
     print(" 🔎 CURRENT PAGE ERROR SCAN")
@@ -1219,8 +1389,9 @@ def check_errors_now():
     if not has_issues:
         print("\n✅ Clean: No form validation errors or alert banners detected on this page.")
     print("=" * 70)
+    return state
 
-def describe_current_page():
+def describe_current_page() -> Dict[str, Any]:
     snapshot = get_orca_snapshot()
     elements = smart_dom_prune(snapshot)
     state = get_page_verification_state()
@@ -1283,7 +1454,21 @@ def describe_current_page():
             print(f"   - [{b['ref']}] \"{b['name']}\" (python3 orca_smart_search.py --click \"{b['name']}\")")
     print("=" * 75)
 
-def search_elements(query: str, top_k: int = 5):
+    return {
+        "title": state.get("title", ""),
+        "url": state.get("url", ""),
+        "page_type": page_type,
+        "total_elements": len(elements),
+        "inputs": inputs,
+        "buttons": buttons,
+        "links": links,
+        "checkables": checkables,
+        "dialogs": state.get("dialogs", []),
+        "alerts": state.get("alerts", []),
+        "invalid_inputs": state.get("invalidInputs", [])
+    }
+
+def search_elements(query: str, top_k: int = 5) -> Dict[str, Any]:
     snapshot = get_orca_snapshot()
     origin = snapshot.get("result", {}).get("origin", "unknown")
     total_refs = len(snapshot.get("result", {}).get("refs", {}))
@@ -1304,7 +1489,12 @@ def search_elements(query: str, top_k: int = 5):
 
     if not scored:
         print("❌ No matching elements found.")
-        return
+        return {
+            "query": query,
+            "origin": origin,
+            "total_pruned": len(pruned),
+            "matches": []
+        }
 
     # Check ambiguity among top candidates
     if len(scored) >= 2:
@@ -1329,86 +1519,211 @@ def search_elements(query: str, top_k: int = 5):
             print(f"   👉 One-Step Click: python3 orca_smart_search.py --click \"{el['name']}\"")
         print("-" * 70)
 
+    matches = [
+        {
+            "rank": i,
+            "score": round(score, 3),
+            "ref": el["ref"],
+            "role": el["role"],
+            "name": el["name"],
+            "suggested_action": el["suggested_action"]
+        }
+        for i, (score, el) in enumerate(scored[:top_k], 1)
+    ]
+    return {
+        "query": query,
+        "origin": origin,
+        "total_pruned": len(pruned),
+        "matches": matches
+    }
+
 def main():
-    try:
-        if len(sys.argv) < 2 or sys.argv[1].lower() in ["--describe", "describe", "-d", "info"]:
-            describe_current_page()
-        elif sys.argv[1].lower() in ["--check-errors", "errors", "check"]:
-            check_errors_now()
-        elif sys.argv[1].lower() in ["--click", "-c"]:
-            if len(sys.argv) < 3:
-                print("Usage: python3 orca_smart_search.py --click <query_or_ref>")
-                sys.exit(1)
-            target = " ".join(sys.argv[2:])
-            act_click_and_verify(target)
-        elif sys.argv[1].lower() in ["--fill", "-f"]:
-            if len(sys.argv) < 4:
-                print("Usage: python3 orca_smart_search.py --fill <query_or_ref> <value>")
-                sys.exit(1)
-            target = sys.argv[2]
-            value = " ".join(sys.argv[3:])
-            act_fill_and_verify(target, value)
-        elif sys.argv[1].lower() in ["--fill-form", "--form", "-ff"]:
-            if len(sys.argv) < 3:
-                print("Usage: python3 orca_smart_search.py --fill-form '<json_string_or_filepath>'")
-                sys.exit(1)
-            form_payload = " ".join(sys.argv[2:])
-            act_fill_form(form_payload)
-        elif sys.argv[1].lower() in ["--check", "-chk"]:
-            if len(sys.argv) < 3:
-                print("Usage: python3 orca_smart_search.py --check <target_query_or_ref>")
-                sys.exit(1)
-            target = " ".join(sys.argv[2:])
-            act_checkbox_radio(target, action="check")
-        elif sys.argv[1].lower() in ["--uncheck", "-unchk"]:
-            if len(sys.argv) < 3:
-                print("Usage: python3 orca_smart_search.py --uncheck <target_query_or_ref>")
-                sys.exit(1)
-            target = " ".join(sys.argv[2:])
-            act_checkbox_radio(target, action="uncheck")
-        elif sys.argv[1].lower() in ["--toggle", "-t"]:
-            if len(sys.argv) < 3:
-                print("Usage: python3 orca_smart_search.py --toggle <target_query_or_ref>")
-                sys.exit(1)
-            target = " ".join(sys.argv[2:])
-            act_checkbox_radio(target, action="toggle")
-        elif sys.argv[1].lower() in ["--wait-for", "--wait", "-w"]:
-            if len(sys.argv) < 3:
-                print("Usage: python3 orca_smart_search.py --wait-for <text_or_selector> [timeout_seconds]")
-                sys.exit(1)
-            target = sys.argv[2]
-            timeout = float(sys.argv[3]) if len(sys.argv) >= 4 else 10.0
-            act_wait_for(target, timeout=timeout, condition="visible")
-        elif sys.argv[1].lower() in ["--wait-until-gone", "--wait-gone"]:
-            if len(sys.argv) < 3:
-                print("Usage: python3 orca_smart_search.py --wait-until-gone <text_or_selector> [timeout_seconds]")
-                sys.exit(1)
-            target = sys.argv[2]
-            timeout = float(sys.argv[3]) if len(sys.argv) >= 4 else 10.0
-            act_wait_for(target, timeout=timeout, condition="gone")
+    global IS_JSON_MODE
+    raw_args = sys.argv[1:]
+    args = []
+    for a in raw_args:
+        if a in ["--json", "-j"]:
+            IS_JSON_MODE = True
         else:
-            query = " ".join(sys.argv[1:])
-            search_elements(query, top_k=5)
+            args.append(a)
+
+    try:
+        if not args or args[0].lower() in ["--describe", "describe", "-d", "info"]:
+            res = describe_current_page()
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "describe", "result": res})
+        elif args[0].lower() in ["--check-errors", "errors", "check"]:
+            res = check_errors_now()
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "check_errors", "result": res})
+        elif args[0].lower() in ["--click", "-c"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --click <query_or_ref>")
+            target = " ".join(args[1:])
+            res = act_click_and_verify(target)
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "click", "target": target, "result": res})
+        elif args[0].lower() in ["--fill", "-f"]:
+            if len(args) < 3:
+                raise OrcaError("Usage: python3 orca_smart_search.py --fill <query_or_ref> <value>")
+            target = args[1]
+            value = " ".join(args[2:])
+            res = act_fill_and_verify(target, value)
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "fill", "target": target, "value": value, "result": res})
+        elif args[0].lower() in ["--fill-form", "--form", "-ff"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --fill-form '<json_string_or_filepath>'")
+            form_payload = " ".join(args[1:])
+            res = act_fill_form(form_payload)
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "fill_form", "result": res})
+        elif args[0].lower() in ["--check", "-chk"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --check <target_query_or_ref>")
+            target = " ".join(args[1:])
+            res = act_checkbox_radio(target, action="check")
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "check", "target": target, "result": res})
+        elif args[0].lower() in ["--uncheck", "-unchk"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --uncheck <target_query_or_ref>")
+            target = " ".join(args[1:])
+            res = act_checkbox_radio(target, action="uncheck")
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "uncheck", "target": target, "result": res})
+        elif args[0].lower() in ["--toggle", "-t"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --toggle <target_query_or_ref>")
+            target = " ".join(args[1:])
+            res = act_checkbox_radio(target, action="toggle")
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "toggle", "target": target, "result": res})
+        elif args[0].lower() in ["--wait-for", "--wait", "-w"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --wait-for <text_or_selector> [timeout_seconds]")
+            target = args[1]
+            timeout = float(args[2]) if len(args) >= 3 else 10.0
+            res = act_wait_for(target, timeout=timeout, condition="visible")
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "wait_visible", "target": target, "result": res})
+        elif args[0].lower() in ["--wait-until-gone", "--wait-gone"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --wait-until-gone <text_or_selector> [timeout_seconds]")
+            target = args[1]
+            timeout = float(args[2]) if len(args) >= 3 else 10.0
+            res = act_wait_for(target, timeout=timeout, condition="gone")
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "wait_gone", "target": target, "result": res})
+        elif args[0].lower() in ["--press", "--keypress", "-p"]:
+            if len(args) < 2:
+                raise OrcaError("Usage: python3 orca_smart_search.py --press <key> [target_query_or_ref]")
+            key = args[1]
+            target = " ".join(args[2:]) if len(args) >= 3 else None
+            res = act_keypress(key, target=target)
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "keypress", "key": key, "target": target, "result": res})
+        elif args[0].lower() in ["--screenshot", "--shot", "-ss"]:
+            fmt = "png"
+            out_path = None
+            i = 1
+            while i < len(args):
+                if args[i] in ["--format", "-fmt"] and i + 1 < len(args):
+                    fmt = args[i + 1].lower()
+                    i += 2
+                else:
+                    out_path = args[i]
+                    i += 1
+            res = act_screenshot(output_path=out_path, format=fmt)
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "screenshot", "result": res})
+        else:
+            query = " ".join(args)
+            res = search_elements(query, top_k=5)
+            if IS_JSON_MODE:
+                emit_json({"ok": True, "action": "search", "result": res})
     except OptionUnavailableError as e:
-        print(f"\n❌ OPTION UNAVAILABLE: {e}", file=sys.stderr)
+        if IS_JSON_MODE:
+            emit_json({
+                "ok": False,
+                "error_type": "OptionUnavailableError",
+                "error": str(e),
+                "available_options": getattr(e, "available_options", []),
+                "target": getattr(e, "target", None),
+                "element": getattr(e, "element", None),
+                "exit_code": 6
+            })
+        else:
+            _builtin_print(f"\n❌ OPTION UNAVAILABLE: {e}", file=sys.stderr)
         sys.exit(6)
     except ElementDisabledError as e:
-        print(f"\n⚠️  ELEMENT DISABLED: {e}", file=sys.stderr)
+        if IS_JSON_MODE:
+            emit_json({
+                "ok": False,
+                "error_type": "ElementDisabledError",
+                "error": str(e),
+                "target": getattr(e, "target", None),
+                "exit_code": 7
+            })
+        else:
+            _builtin_print(f"\n⚠️  ELEMENT DISABLED: {e}", file=sys.stderr)
         sys.exit(7)
     except AmbiguousTargetError as e:
-        print(f"\n⚠️  AMBIGUITY ERROR: {e}", file=sys.stderr)
+        if IS_JSON_MODE:
+            emit_json({
+                "ok": False,
+                "error_type": "AmbiguousTargetError",
+                "error": str(e),
+                "candidates": getattr(e, "candidates", []),
+                "exit_code": 2
+            })
+        else:
+            _builtin_print(f"\n⚠️  AMBIGUITY ERROR: {e}", file=sys.stderr)
         sys.exit(2)
     except ElementNotFoundError as e:
-        print(f"\n❌ NOT FOUND: {e}", file=sys.stderr)
+        if IS_JSON_MODE:
+            emit_json({
+                "ok": False,
+                "error_type": "ElementNotFoundError",
+                "error": str(e),
+                "target": getattr(e, "target", None),
+                "exit_code": 3
+            })
+        else:
+            _builtin_print(f"\n❌ NOT FOUND: {e}", file=sys.stderr)
         sys.exit(3)
     except OrcaNotFoundError as e:
-        print(f"\n❌ ORCA CLI ERROR: {e}", file=sys.stderr)
+        if IS_JSON_MODE:
+            emit_json({
+                "ok": False,
+                "error_type": "OrcaNotFoundError",
+                "error": str(e),
+                "exit_code": 4
+            })
+        else:
+            _builtin_print(f"\n❌ ORCA CLI ERROR: {e}", file=sys.stderr)
         sys.exit(4)
     except OrcaError as e:
-        print(f"\n❌ ORCA ERROR: {e}", file=sys.stderr)
+        if IS_JSON_MODE:
+            emit_json({
+                "ok": False,
+                "error_type": "OrcaError",
+                "error": str(e),
+                "exit_code": 5
+            })
+        else:
+            _builtin_print(f"\n❌ ORCA ERROR: {e}", file=sys.stderr)
         sys.exit(5)
     except Exception as e:
-        print(f"\n❌ UNEXPECTED ERROR: {e}", file=sys.stderr)
+        if IS_JSON_MODE:
+            emit_json({
+                "ok": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "exit_code": 1
+            })
+        else:
+            _builtin_print(f"\n❌ UNEXPECTED ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":

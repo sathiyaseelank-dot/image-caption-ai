@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import json
 import subprocess
+import os
 
 import orca_smart_search as oss
 
@@ -274,8 +275,10 @@ class TestNewFeatures(unittest.TestCase):
         mock_check.assert_any_call("Opt out", "uncheck")
 
     def test_option_unavailable_error(self):
-        err = oss.OptionUnavailableError("Option '2001' not in [2026, 2027]")
+        err = oss.OptionUnavailableError("Option '2001' not in [2026, 2027]", available_options=["2026", "2027"], target="2001")
         self.assertIsInstance(err, oss.OrcaError)
+        self.assertEqual(err.available_options, ["2026", "2027"])
+        self.assertEqual(err.target, "2001")
 
     @patch("orca_smart_search.resolve_target_element")
     def test_click_disabled_element_raises_element_disabled_error(self, mock_resolve):
@@ -283,6 +286,96 @@ class TestNewFeatures(unittest.TestCase):
         with self.assertRaises(oss.ElementDisabledError) as ctx:
             oss.act_click_and_verify("Previous year")
         self.assertIn("disabled", str(ctx.exception))
+
+    @patch("orca_smart_search.get_page_verification_state", return_value={"url": "https://example.com"})
+    @patch("orca_smart_search.run_cmd")
+    def test_act_keypress_without_target(self, mock_run, mock_state):
+        res = oss.act_keypress("Escape")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["key"], "Escape")
+        self.assertIsNone(res["target"])
+        mock_run.assert_called_with([oss.ORCA_BIN, "keypress", "--key", "Escape"])
+
+    @patch("orca_smart_search.resolve_target_element")
+    @patch("orca_smart_search.get_page_verification_state", return_value={"url": "https://example.com"})
+    @patch("orca_smart_search.run_cmd")
+    def test_act_keypress_with_target(self, mock_run, mock_state, mock_resolve):
+        mock_resolve.return_value = ("e5", {"name": "Search Button", "role": "button", "disabled": False})
+        res = oss.act_keypress("Enter", target="Search Button")
+        self.assertTrue(res["success"])
+        self.assertEqual(res["key"], "Enter")
+        self.assertEqual(res["target"], "Search Button")
+        self.assertEqual(res["target_ref"], "e5")
+
+    @patch("orca_smart_search.resolve_target_element")
+    def test_act_keypress_disabled_element_raises(self, mock_resolve):
+        mock_resolve.return_value = ("e6", {"name": "Submit", "role": "button", "disabled": True})
+        with self.assertRaises(oss.ElementDisabledError):
+            oss.act_keypress("Enter", target="Submit")
+
+    @patch("orca_smart_search.run_cmd")
+    def test_act_screenshot_decodes_and_saves(self, mock_run):
+        import tempfile
+        import base64
+        fake_bytes = b"fake-png-binary-stream-data"
+        fake_b64 = base64.b64encode(fake_bytes).decode("utf-8")
+        mock_run.return_value = json.dumps({"ok": True, "result": {"data": fake_b64, "format": "png"}})
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            res = oss.act_screenshot(output_path=tmp_path)
+            self.assertTrue(res["success"])
+            self.assertEqual(res["format"], "png")
+            self.assertEqual(res["size_bytes"], len(fake_bytes))
+            with open(tmp_path, "rb") as f:
+                saved = f.read()
+            self.assertEqual(saved, fake_bytes)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+import io
+
+class TestJsonCliMode(unittest.TestCase):
+    @patch("sys.exit")
+    @patch("orca_smart_search.act_keypress", return_value={"success": True, "key": "Escape"})
+    def test_json_keypress_cli(self, mock_act, mock_exit):
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            with patch("sys.argv", ["orca_smart_search.py", "--press", "Escape", "--json"]):
+                oss.main()
+            output = mock_stdout.getvalue().strip()
+            parsed = json.loads(output)
+            self.assertTrue(parsed["ok"])
+            self.assertEqual(parsed["action"], "keypress")
+            self.assertEqual(parsed["key"], "Escape")
+
+    @patch("sys.exit")
+    @patch("orca_smart_search.act_screenshot", return_value={"success": True, "path": "/fake/shot.png", "format": "png", "size_bytes": 100, "timestamp": "2026-10-23T00:00:00"})
+    def test_json_screenshot_cli(self, mock_act, mock_exit):
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            with patch("sys.argv", ["orca_smart_search.py", "--screenshot", "--json"]):
+                oss.main()
+            output = mock_stdout.getvalue().strip()
+            parsed = json.loads(output)
+            self.assertTrue(parsed["ok"])
+            self.assertEqual(parsed["action"], "screenshot")
+            self.assertEqual(parsed["result"]["path"], "/fake/shot.png")
+
+    @patch("sys.exit")
+    @patch("orca_smart_search.act_click_and_verify", side_effect=oss.ElementNotFoundError("Element not found", target="missing_btn"))
+    def test_json_error_cli(self, mock_act, mock_exit):
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            with patch("sys.argv", ["orca_smart_search.py", "--click", "missing_btn", "--json"]):
+                oss.main()
+            mock_exit.assert_called_with(3)
+            output = mock_stdout.getvalue().strip()
+            parsed = json.loads(output)
+            self.assertFalse(parsed["ok"])
+            self.assertEqual(parsed["error_type"], "ElementNotFoundError")
+            self.assertEqual(parsed["exit_code"], 3)
+            self.assertEqual(parsed["target"], "missing_btn")
 
 if __name__ == "__main__":
     unittest.main()
