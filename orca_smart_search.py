@@ -504,8 +504,9 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
 
         is_input = role in ["combobox", "textbox", "searchbox", "search", "spinbutton", "date"]
-        is_button = role in ["button", "menuitem", "switch"]
+        is_button = role in ["button", "menuitem"]
         is_link = role == "link"
+        is_checkable = role in ["checkbox", "radio", "switch"]
 
         inline_val = ref_values.get(ref_id, "")
         context = ref_contexts.get(ref_id, "")
@@ -522,7 +523,12 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not semantic_text:
             continue
 
-        action_type = "fill" if is_input else "click"
+        if is_checkable:
+            action_type = "check"
+        elif is_input:
+            action_type = "fill"
+        else:
+            action_type = "click"
 
         pruned.append({
             "ref": ref_id,
@@ -534,7 +540,8 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "is_input": is_input,
             "is_button": is_button,
             "is_link": is_link,
-            "is_interactive": (is_input or is_button or is_link),
+            "is_checkable": is_checkable,
+            "is_interactive": (is_input or is_button or is_link or is_checkable),
             "semantic_text": semantic_text,
             "suggested_action": action_type
         })
@@ -834,6 +841,322 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
     print("=" * 70)
     return comparison
 
+def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
+    """
+    Toggles or sets the checked state of a checkbox, radio button, or switch.
+    action can be: 'check', 'uncheck', or 'toggle'.
+    """
+    action = action.lower()
+    if action not in ["check", "uncheck", "toggle"]:
+        raise ValueError(f"Invalid action: '{action}'. Choose from 'check', 'uncheck', or 'toggle'.")
+
+    print(f"\n🎯 Finding target element for {action}: '{target}'...")
+    ref, info = resolve_target_element(target)
+    name = info.get("name") or info.get("role")
+    role = info.get("role", "")
+    print(f"👉 Matched element: [{ref}] \"{name}\" ({role})")
+
+    # Evaluate and toggle checked state via client-side script with event dispatching
+    js_toggle = rf"""
+    (() => {{
+        const targetName = {json.dumps(name or "")};
+        const targetQuery = {json.dumps(target)};
+        const action = {json.dumps(action)};
+
+        const checkables = Array.from(document.querySelectorAll(
+            'input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], [role="switch"]'
+        ));
+        let targetEl = null;
+
+        const qWords = (targetName + ' ' + targetQuery).toLowerCase().split(/[\s\-_]+/).filter(Boolean);
+        let bestScore = -1;
+
+        checkables.forEach(el => {{
+            let label = '';
+            if (el.labels && el.labels[0]) label = el.labels[0].innerText;
+            else if (el.closest('label')) label = el.closest('label').innerText;
+            else if (el.parentElement) label = el.parentElement.innerText;
+            const text = (label + ' ' + el.name + ' ' + el.id + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+            let score = 0;
+            qWords.forEach(w => {{ if (text.includes(w)) score++; }});
+            if (score > bestScore) {{
+                bestScore = score;
+                targetEl = el;
+            }}
+        }});
+
+        if (!targetEl && checkables.length > 0) {{
+            targetEl = checkables[0];
+        }}
+
+        if (!targetEl) {{
+            return {{ error: 'No checkbox/radio element found on page' }};
+        }}
+
+        const initialChecked = targetEl.checked !== undefined 
+            ? Boolean(targetEl.checked) 
+            : (targetEl.getAttribute('aria-checked') === 'true');
+
+        let desiredChecked = initialChecked;
+        if (action === 'check') desiredChecked = true;
+        else if (action === 'uncheck') desiredChecked = false;
+        else if (action === 'toggle') desiredChecked = !initialChecked;
+
+        if (initialChecked === desiredChecked && action !== 'toggle') {{
+            return {{
+                success: true,
+                changed: false,
+                initialState: initialChecked,
+                finalState: initialChecked,
+                message: 'Already in desired state'
+            }};
+        }}
+
+        targetEl.scrollIntoView({{ block: 'center' }});
+        targetEl.click();
+        if (targetEl.checked !== undefined) {{
+            targetEl.checked = desiredChecked;
+        }}
+        if (targetEl.hasAttribute('aria-checked')) {{
+            targetEl.setAttribute('aria-checked', String(desiredChecked));
+        }}
+        targetEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        targetEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+        const finalChecked = targetEl.checked !== undefined 
+            ? Boolean(targetEl.checked) 
+            : (targetEl.getAttribute('aria-checked') === 'true');
+
+        return {{
+            success: true,
+            changed: (initialChecked !== finalChecked),
+            initialState: initialChecked,
+            finalState: finalChecked,
+            tag: targetEl.tagName.toLowerCase(),
+            type: targetEl.type || targetEl.getAttribute('role') || 'checkbox'
+        }};
+    }})()
+    """
+
+    try:
+        raw_res = run_cmd([ORCA_BIN, "eval", "--expression", js_toggle])
+        res = json.loads(raw_res)
+    except Exception:
+        print(f"⚡ Fallback executing: orca click --element {ref}")
+        run_cmd([ORCA_BIN, "click", "--element", ref])
+        res = {"success": True, "changed": True, "initialState": "unknown", "finalState": "toggled"}
+
+    print("\n" + "=" * 70)
+    print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
+    print("=" * 70)
+    print(f"Target Element : [{ref}] \"{name}\" ({role})")
+    print(f"Action Taken   : {action.upper()}")
+    init_str = "Checked (true)" if res.get("initialState") is True else "Unchecked (false)" if res.get("initialState") is False else str(res.get("initialState"))
+    final_str = "Checked (true)" if res.get("finalState") is True else "Unchecked (false)" if res.get("finalState") is False else str(res.get("finalState"))
+    print(f"Initial State  : {init_str}")
+    print(f"Final State    : {final_str}")
+    if res.get("changed"):
+        print(f"Status         : ✅ SUCCESSFULLY {action.upper()}ED")
+    else:
+        print(f"Status         : ℹ️ ALREADY {action.upper()}ED (No change needed)")
+    print("=" * 70)
+
+    return res
+
+def act_fill_form(form_input: str) -> Dict[str, Any]:
+    """
+    Fills multiple form fields in sequence from a JSON string or JSON file path.
+    Seamlessly handles text inputs, dropdowns, dates, and boolean checkboxes.
+    """
+    raw_json = form_input.strip()
+    if os.path.exists(raw_json) and os.path.isfile(raw_json):
+        with open(raw_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        try:
+            data = json.loads(raw_json)
+        except json.JSONDecodeError as e:
+            raise OrcaError(f"Invalid JSON provided for --fill-form: {e}")
+
+    if not isinstance(data, dict):
+        raise OrcaError("--fill-form expects a JSON object of key-value pairs (e.g. '{\"Field\": \"Value\"}')")
+
+    print("\n" + "=" * 70)
+    print(" 📝 STARTING BATCH FORM FILL")
+    print(f" Total Fields to Populate: {len(data)}")
+    print("=" * 70)
+
+    results = []
+    success_count = 0
+
+    for i, (target, val) in enumerate(data.items(), 1):
+        if isinstance(val, bool):
+            action_desc = "CHECK" if val else "UNCHECK"
+            print(f"\n--- [{i}/{len(data)}] Setting checkbox '{target}' ➔ {action_desc} ---")
+            try:
+                res = act_checkbox_radio(target, "check" if val else "uncheck")
+                results.append({
+                    "field": target,
+                    "value": val,
+                    "status": "SUCCESS",
+                    "error": None
+                })
+                success_count += 1
+            except Exception as e:
+                print(f"❌ Failed to set checkbox '{target}': {e}")
+                results.append({
+                    "field": target,
+                    "value": val,
+                    "status": "FAILED",
+                    "error": str(e)
+                })
+        else:
+            str_val = str(val)
+            print(f"\n--- [{i}/{len(data)}] Filling field '{target}' ➔ '{str_val}' ---")
+            try:
+                res = act_fill_and_verify(target, str_val)
+                results.append({
+                    "field": target,
+                    "value": str_val,
+                    "status": "SUCCESS",
+                    "error": None
+                })
+                success_count += 1
+            except Exception as e:
+                print(f"❌ Failed to fill field '{target}': {e}")
+                results.append({
+                    "field": target,
+                    "value": str_val,
+                    "status": "FAILED",
+                    "error": str(e)
+                })
+
+    time.sleep(0.3)
+    final_state = get_page_verification_state()
+    invalid_inputs = final_state.get("invalidInputs", [])
+
+    print("\n" + "=" * 70)
+    print(" 📊 BATCH FORM FILL SUMMARY REPORT")
+    print("=" * 70)
+    print(f"Success Rate   : {success_count}/{len(data)} fields populated successfully.")
+    for r in results:
+        icon = "✅" if r["status"] == "SUCCESS" else "❌"
+        err_msg = f" (Error: {r['error']})" if r["error"] else ""
+        print(f" {icon} Field: \"{r['field']}\" ➔ \"{r['value']}\"{err_msg}")
+
+    if invalid_inputs:
+        print("\n⚠️  Remaining Invalid Fields Detected:")
+        for inp in invalid_inputs:
+            name = inp["label"] or inp["name"] or inp["id"]
+            print(f"   • \"{name}\": {inp['validationMessage']}")
+    else:
+        print("\n✨ Clean: All form fields populated without validation errors!")
+    print("=" * 70)
+
+    return {
+        "total": len(data),
+        "success_count": success_count,
+        "results": results,
+        "invalid_inputs": invalid_inputs
+    }
+
+def act_wait_for(target: str, timeout: float = 10.0, poll_interval: float = 0.5, condition: str = "visible") -> Dict[str, Any]:
+    """
+    Waits asynchronously for an element, text, or selector to appear ('visible') or disappear ('gone').
+    Also monitors and detects active loading spinners.
+    """
+    condition = condition.lower()
+    start_time = time.time()
+    deadline = start_time + timeout
+
+    print(f"\n⏳ Waiting for condition '{condition.upper()}' on: '{target}' (timeout: {timeout:.1f}s)...")
+
+    js_check = rf"""
+    (() => {{
+        const target = {json.dumps(target)};
+        const condition = {json.dumps(condition)};
+
+        const spinners = document.querySelectorAll(
+            '.spinner, .loading, .loader, [role="progressbar"], .mat-progress-bar, .ant-spin'
+        );
+        let spinnerActive = false;
+        spinners.forEach(s => {{
+            if (s.offsetParent !== null && window.getComputedStyle(s).display !== 'none') {{
+                spinnerActive = true;
+            }}
+        }});
+
+        const bodyText = document.body ? document.body.innerText : '';
+        const hasText = bodyText.toLowerCase().includes(target.toLowerCase());
+
+        let hasSelector = false;
+        try {{
+            const el = document.querySelector(target);
+            if (el && el.offsetParent !== null && window.getComputedStyle(el).display !== 'none') {{
+                hasSelector = true;
+            }}
+        }} catch(e) {{}}
+
+        const isPresent = hasText || hasSelector;
+
+        return {{
+            target: target,
+            isPresent: isPresent,
+            spinnerActive: spinnerActive,
+            matchedType: hasSelector ? 'selector' : (hasText ? 'text' : 'none')
+        }};
+    }})()
+    """
+
+    found = False
+    spinner_seen = False
+
+    while time.time() < deadline:
+        try:
+            raw = run_cmd([ORCA_BIN, "eval", "--expression", js_check])
+            res = json.loads(raw)
+            if res.get("spinnerActive"):
+                spinner_seen = True
+
+            if condition == "visible" and res.get("isPresent"):
+                found = True
+                break
+            elif condition == "gone" and not res.get("isPresent"):
+                found = True
+                break
+        except Exception:
+            pass
+
+        time.sleep(poll_interval)
+
+    elapsed = round(time.time() - start_time, 2)
+
+    print("\n" + "=" * 70)
+    print(" ⏳ SMART ASYNC WAIT REPORT")
+    print("=" * 70)
+    print(f"Target Query   : \"{target}\"")
+    print(f"Condition      : {condition.upper()}")
+    print(f"Elapsed Time   : {elapsed}s (Timeout: {timeout}s)")
+    if spinner_seen:
+        print("Spinner Status : 🔄 Active loader/spinner observed during wait")
+
+    if found:
+        print(f"Status         : ✅ CONDITION MET ({condition.upper()})")
+    else:
+        print(f"Status         : ⏱️  TIMED OUT (Condition not met within {timeout}s)")
+    print("=" * 70)
+
+    if not found:
+        raise OrcaError(f"Wait timed out after {elapsed}s waiting for '{target}' to be {condition}.")
+
+    return {
+        "success": found,
+        "elapsed": elapsed,
+        "condition": condition,
+        "target": target,
+        "spinner_seen": spinner_seen
+    }
+
 def check_errors_now():
     state = get_page_verification_state()
     print("\n" + "=" * 70)
@@ -875,6 +1198,7 @@ def describe_current_page():
     state = get_page_verification_state()
 
     inputs = [el for el in elements if el["is_input"]]
+    checkables = [el for el in elements if el.get("is_checkable")]
     buttons = [el for el in elements if el["is_button"]]
     links = [el for el in elements if el["is_link"]]
 
@@ -889,7 +1213,7 @@ def describe_current_page():
 
     if is_search_page:
         page_type = "Search Results / Search Engine Page"
-    elif len(inputs) >= 2 or any("form" in state["url"].lower() for _ in [1]):
+    elif len(inputs) + len(checkables) >= 2 or any("form" in state["url"].lower() for _ in [1]):
         page_type = "Interactive Form / Data-Entry Page"
     else:
         page_type = "Content / Information Page"
@@ -901,7 +1225,7 @@ def describe_current_page():
     print(f"🌐 URL              : {state['url']}")
     print(f"🏷️  Page Category    : {page_type}")
     print("-" * 75)
-    print(f"📊 Elements Found   : {len(inputs)} Inputs/Fields | {len(buttons)} Buttons | {len(links)} Links")
+    print(f"📊 Elements Found   : {len(inputs)} Inputs/Fields | {len(checkables)} Checkboxes/Radios | {len(buttons)} Buttons | {len(links)} Links")
 
     print("\n⌨️  AVAILABLE INPUT FIELDS:")
     if not inputs:
@@ -913,6 +1237,15 @@ def describe_current_page():
             role = inp["role"]
             print(f"   [{i}] Ref: [{ref}] | Type: {role:<10} | Label: \"{name}\"")
             print(f"       👉 Fill with: python3 orca_smart_search.py --fill \"{name}\" \"<text>\"")
+
+    if checkables:
+        print("\n☑️  AVAILABLE CHECKBOXES & RADIOS:")
+        for i, chk in enumerate(checkables[:6], 1):
+            ref = chk["ref"]
+            name = chk["name"] or "Unnamed option"
+            role = chk["role"]
+            print(f"   [{i}] Ref: [{ref}] | Type: {role:<10} | Label: \"{name}\"")
+            print(f"       👉 Toggle with: python3 orca_smart_search.py --toggle \"{name}\"")
 
     print("\n🔘 KEY ACTION BUTTONS (Top 6):")
     if not buttons:
@@ -987,6 +1320,44 @@ def main():
             target = sys.argv[2]
             value = " ".join(sys.argv[3:])
             act_fill_and_verify(target, value)
+        elif sys.argv[1].lower() in ["--fill-form", "--form", "-ff"]:
+            if len(sys.argv) < 3:
+                print("Usage: python3 orca_smart_search.py --fill-form '<json_string_or_filepath>'")
+                sys.exit(1)
+            form_payload = " ".join(sys.argv[2:])
+            act_fill_form(form_payload)
+        elif sys.argv[1].lower() in ["--check", "-chk"]:
+            if len(sys.argv) < 3:
+                print("Usage: python3 orca_smart_search.py --check <target_query_or_ref>")
+                sys.exit(1)
+            target = " ".join(sys.argv[2:])
+            act_checkbox_radio(target, action="check")
+        elif sys.argv[1].lower() in ["--uncheck", "-unchk"]:
+            if len(sys.argv) < 3:
+                print("Usage: python3 orca_smart_search.py --uncheck <target_query_or_ref>")
+                sys.exit(1)
+            target = " ".join(sys.argv[2:])
+            act_checkbox_radio(target, action="uncheck")
+        elif sys.argv[1].lower() in ["--toggle", "-t"]:
+            if len(sys.argv) < 3:
+                print("Usage: python3 orca_smart_search.py --toggle <target_query_or_ref>")
+                sys.exit(1)
+            target = " ".join(sys.argv[2:])
+            act_checkbox_radio(target, action="toggle")
+        elif sys.argv[1].lower() in ["--wait-for", "--wait", "-w"]:
+            if len(sys.argv) < 3:
+                print("Usage: python3 orca_smart_search.py --wait-for <text_or_selector> [timeout_seconds]")
+                sys.exit(1)
+            target = sys.argv[2]
+            timeout = float(sys.argv[3]) if len(sys.argv) >= 4 else 10.0
+            act_wait_for(target, timeout=timeout, condition="visible")
+        elif sys.argv[1].lower() in ["--wait-until-gone", "--wait-gone"]:
+            if len(sys.argv) < 3:
+                print("Usage: python3 orca_smart_search.py --wait-until-gone <text_or_selector> [timeout_seconds]")
+                sys.exit(1)
+            target = sys.argv[2]
+            timeout = float(sys.argv[3]) if len(sys.argv) >= 4 else 10.0
+            act_wait_for(target, timeout=timeout, condition="gone")
         else:
             query = " ".join(sys.argv[1:])
             search_elements(query, top_k=5)

@@ -222,5 +222,56 @@ class TestCliErrorHandling(unittest.TestCase):
             oss.run_cmd(["orca", "snapshot"], timeout=5.0)
         self.assertIn("timed out", str(ctx.exception))
 
+class TestNewFeatures(unittest.TestCase):
+    def test_prune_recognizes_checkboxes_and_radios(self):
+        snapshot_data = {
+            "result": {
+                "origin": "https://example.com",
+                "refs": {
+                    "e1": {"name": "Accept Terms", "role": "checkbox"},
+                    "e2": {"name": "Male", "role": "radio"},
+                    "e3": {"name": "Dark Mode", "role": "switch"}
+                },
+                "snapshot": '- checkbox "Accept Terms" [ref=e1]\n- radio "Male" [ref=e2]\n- switch "Dark Mode" [ref=e3]'
+            }
+        }
+        pruned = oss.smart_dom_prune(snapshot_data)
+        self.assertEqual(len(pruned), 3)
+        for p in pruned:
+            self.assertTrue(p["is_checkable"])
+            self.assertTrue(p["is_interactive"])
+            self.assertEqual(p["suggested_action"], "check")
+
+    def test_act_checkbox_radio_invalid_action(self):
+        with self.assertRaises(ValueError):
+            oss.act_checkbox_radio("e1", action="invalid_action")
+
+    def test_fill_form_invalid_json_raises(self):
+        with self.assertRaises(oss.OrcaError) as ctx:
+            oss.act_fill_form("this is not json")
+        self.assertIn("Invalid JSON", str(ctx.exception))
+
+    def test_fill_form_non_dict_json_raises(self):
+        with self.assertRaises(oss.OrcaError) as ctx:
+            oss.act_fill_form('["item1", "item2"]')
+        self.assertIn("JSON object", str(ctx.exception))
+
+    @patch("orca_smart_search.act_fill_and_verify")
+    @patch("orca_smart_search.act_checkbox_radio")
+    @patch("orca_smart_search.get_page_verification_state", return_value={"invalidInputs": []})
+    def test_fill_form_processes_text_and_booleans(self, mock_state, mock_check, mock_fill):
+        payload = json.dumps({
+            "Full Name": "Test User",
+            "I agree": True,
+            "Opt out": False
+        })
+        res = oss.act_fill_form(payload)
+        self.assertEqual(res["total"], 3)
+        self.assertEqual(res["success_count"], 3)
+        mock_fill.assert_called_once_with("Full Name", "Test User")
+        self.assertEqual(mock_check.call_count, 2)
+        mock_check.assert_any_call("I agree", "check")
+        mock_check.assert_any_call("Opt out", "uncheck")
+
 if __name__ == "__main__":
     unittest.main()
