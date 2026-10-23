@@ -857,7 +857,7 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                 }}
             }});
 
-            if (bestSelect) {{
+            if (bestSelect && bestScore > 0) {{
                 bestSelect.scrollIntoView({{block: 'center'}});
                 const allOpts = Array.from(bestSelect.options).map(o => (o.text || o.value || '').trim()).filter(Boolean);
                 const opt = Array.from(bestSelect.options).find(o => 
@@ -890,11 +890,12 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
         try:
             res_raw = run_cmd([ORCA_BIN, "eval", "--expression", select_js])
             select_data = json.loads(res_raw)
+            is_select_element = role in ["combobox", "select"]
             if select_data.get("status") == "selected":
                 selected_text = select_data.get("selected")
                 print(f"⚡ Selected dropdown option: \"{selected_text}\"")
                 actual_filled_val = selected_text
-            elif select_data.get("status") == "unavailable":
+            elif select_data.get("status") == "unavailable" and is_select_element:
                 avail = select_data.get("available", [])
                 avail_str = ", ".join(avail[:10]) + ("..." if select_data.get("total", 0) > 10 else "")
                 print(f"\n❌ OPTION UNAVAILABLE: Option \"{value}\" is not available for \"{name}\".")
@@ -980,7 +981,48 @@ def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
 
     # Execute click via Orca CLI
     print(f"⚡ Executing: orca click --element {ref}")
-    run_cmd([ORCA_BIN, "click", "--element", ref])
+    try:
+        run_cmd([ORCA_BIN, "click", "--element", ref])
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "box model" in err_msg or "cdp error" in err_msg:
+            print(f"⚠️  Direct click hit box model issue, falling back to JS click/toggle for '{name}'...")
+            toggle_js = rf"""
+            (() => {{
+                const target = {json.dumps(name)};
+                const matchAndClick = (doc) => {{
+                    const inputs = Array.from(doc.querySelectorAll('input[type=checkbox], input[type=radio]'));
+                    for (const inp of inputs) {{
+                        const lbl = (inp.labels && inp.labels[0]) ? inp.labels[0].innerText : (inp.parentElement ? inp.parentElement.innerText : '');
+                        const full = (lbl + ' ' + (inp.name || '') + ' ' + (inp.id || '')).toLowerCase();
+                        if (full.includes(target.toLowerCase()) || target.toLowerCase().includes(lbl.toLowerCase())) {{
+                            if (inp.labels && inp.labels[0]) {{
+                                inp.labels[0].click();
+                            }} else {{
+                                inp.click();
+                            }}
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }};
+                if (matchAndClick(document)) return true;
+                const iframes = Array.from(document.querySelectorAll('iframe'));
+                for (const f of iframes) {{
+                    try {{
+                        const idoc = f.contentDocument || f.contentWindow.document;
+                        if (idoc && matchAndClick(idoc)) return true;
+                    }} catch(e) {{}}
+                }}
+                return false;
+            }})()
+            """
+            try:
+                run_cmd([ORCA_BIN, "eval", "--expression", toggle_js])
+            except Exception:
+                raise e
+        else:
+            raise
     time.sleep(0.3)
 
     # Re-inspect post-click state
