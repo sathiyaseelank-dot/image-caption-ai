@@ -775,24 +775,79 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
         (() => {{
             const targetName = {json.dumps(name or "")};
             const targetQuery = {json.dumps(target)};
+            const rawVal = {json.dumps(value)};
             const isoVal = {json.dumps(iso_val)};
-            const dateInputs = Array.from(document.querySelectorAll('input[type="date"], input[type="datetime-local"]'));
-            if (dateInputs.length === 0) return 'no_date_inputs';
-            let bestInput = dateInputs[0];
-            if (dateInputs.length > 1) {{
-                const q = (targetName + ' ' + targetQuery).toLowerCase();
-                dateInputs.forEach(inp => {{
-                    let label = '';
-                    if (inp.labels && inp.labels[0]) label = inp.labels[0].innerText;
-                    else if (inp.closest('label')) label = inp.closest('label').innerText;
-                    const combined = (label + ' ' + inp.name + ' ' + inp.id).toLowerCase();
-                    if (q.split(/\s+/).some(w => combined.includes(w))) bestInput = inp;
-                }});
+            const targetWords = (targetName + ' ' + targetQuery).toLowerCase().split(/[\s\-_]+/).filter(Boolean);
+
+            let allDocs = [document];
+            document.querySelectorAll('iframe').forEach(f => {{
+                try {{
+                    const idoc = f.contentDocument || f.contentWindow.document;
+                    if (idoc) allDocs.push(idoc);
+                }} catch(e) {{}}
+            }});
+
+            let parts = null;
+            const mMatch = rawVal.match(/(\d{{4}})[-\/](\d{{1,2}})[-\/](\d{{1,2}})/);
+            const dMatch = rawVal.match(/(\d{{1,2}})[-\/](\d{{1,2}})[-\/](\d{{4}})/);
+            if (mMatch) {{
+                parts = {{ y: mMatch[1], m: mMatch[2].padStart(2, '0'), d: mMatch[3].padStart(2, '0') }};
+            }} else if (dMatch) {{
+                parts = {{ m: dMatch[1].padStart(2, '0'), d: dMatch[2].padStart(2, '0'), y: dMatch[3] }};
             }}
-            bestInput.value = isoVal;
-            bestInput.dispatchEvent(new Event('input', {{bubbles: true}}));
-            bestInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-            return 'date_set:' + bestInput.value;
+
+            for (const doc of allDocs) {{
+                const containers = Array.from(doc.querySelectorAll('.form-line, .form-input-wide, fieldset, [role="group"]'));
+                for (const c of containers) {{
+                    const cText = (c.innerText || '').toLowerCase();
+                    const hasDateWord = ['birth', 'dob', 'date'].some(w => cText.includes(w) && targetWords.some(tw => tw.includes(w) || w.includes(tw)));
+                    const mInput = c.querySelector('input[id*="month"], input[name*="month"]');
+                    const dInput = c.querySelector('input[id*="day"], input[name*="day"]');
+                    const yInput = c.querySelector('input[id*="year"], input[name*="year"]');
+                    const liteInput = c.querySelector('input[id*="lite_mode"], input[name*="lite_mode"], input[placeholder*="YYYY"], input[placeholder*="MM"]');
+
+                    if ((mInput && dInput && yInput) || liteInput) {{
+                        if (hasDateWord || targetWords.some(tw => cText.includes(tw))) {{
+                            c.scrollIntoView({{block: 'center'}});
+                            if (parts) {{
+                                if (mInput) {{ mInput.value = parts.m; mInput.dispatchEvent(new Event('input', {{bubbles: true}})); mInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                                if (dInput) {{ dInput.value = parts.d; dInput.dispatchEvent(new Event('input', {{bubbles: true}})); dInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                                if (yInput) {{ yInput.value = parts.y; yInput.dispatchEvent(new Event('input', {{bubbles: true}})); yInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                                if (liteInput) {{
+                                    liteInput.value = parts.m + '-' + parts.d + '-' + parts.y;
+                                    liteInput.dispatchEvent(new Event('input', {{bubbles: true}}));
+                                    liteInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+                                }}
+                                return 'date_set:' + (liteInput ? liteInput.value : (parts.y + '-' + parts.m + '-' + parts.d));
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+
+            for (const doc of allDocs) {{
+                const dateInputs = Array.from(doc.querySelectorAll('input[type="date"], input[type="datetime-local"]'));
+                if (dateInputs.length > 0) {{
+                    let bestInput = dateInputs[0];
+                    if (dateInputs.length > 1) {{
+                        const q = (targetName + ' ' + targetQuery).toLowerCase();
+                        dateInputs.forEach(inp => {{
+                            let label = '';
+                            if (inp.labels && inp.labels[0]) label = inp.labels[0].innerText;
+                            else if (inp.closest('label')) label = inp.closest('label').innerText;
+                            const combined = (label + ' ' + inp.name + ' ' + inp.id).toLowerCase();
+                            if (q.split(/\s+/).some(w => combined.includes(w))) bestInput = inp;
+                        }});
+                    }}
+                    bestInput.scrollIntoView({{block: 'center'}});
+                    bestInput.value = isoVal;
+                    bestInput.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    bestInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return 'date_set:' + bestInput.value;
+                }}
+            }}
+
+            return 'no_date_inputs';
         }})()
         """
         try:
