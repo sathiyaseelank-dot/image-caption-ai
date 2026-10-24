@@ -796,32 +796,62 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                 parts = {{ m: dMatch[1].padStart(2, '0'), d: dMatch[2].padStart(2, '0'), y: dMatch[3] }};
             }}
 
+            let compositeCandidates = [];
             for (const doc of allDocs) {{
                 const containers = Array.from(doc.querySelectorAll('.form-line, .form-input-wide, fieldset, [role="group"]'));
                 for (const c of containers) {{
-                    const cText = (c.innerText || '').toLowerCase();
-                    const hasDateWord = ['birth', 'dob', 'date'].some(w => cText.includes(w) && targetWords.some(tw => tw.includes(w) || w.includes(tw)));
                     const mInput = c.querySelector('input[id*="month"], input[name*="month"]');
                     const dInput = c.querySelector('input[id*="day"], input[name*="day"]');
                     const yInput = c.querySelector('input[id*="year"], input[name*="year"]');
                     const liteInput = c.querySelector('input[id*="lite_mode"], input[name*="lite_mode"], input[placeholder*="YYYY"], input[placeholder*="MM"]');
 
                     if ((mInput && dInput && yInput) || liteInput) {{
-                        if (hasDateWord || targetWords.some(tw => cText.includes(tw))) {{
-                            c.scrollIntoView({{block: 'center'}});
-                            if (parts) {{
-                                if (mInput) {{ mInput.value = parts.m; mInput.dispatchEvent(new Event('input', {{bubbles: true}})); mInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                                if (dInput) {{ dInput.value = parts.d; dInput.dispatchEvent(new Event('input', {{bubbles: true}})); dInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                                if (yInput) {{ yInput.value = parts.y; yInput.dispatchEvent(new Event('input', {{bubbles: true}})); yInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                                if (liteInput) {{
-                                    liteInput.value = parts.m + '-' + parts.d + '-' + parts.y;
-                                    liteInput.dispatchEvent(new Event('input', {{bubbles: true}}));
-                                    liteInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                }}
-                                return 'date_set:' + (liteInput ? liteInput.value : (parts.y + '-' + parts.m + '-' + parts.d));
+                        const cText = (c.innerText || '').toLowerCase();
+                        const attrText = (c.id + ' ' + (mInput ? mInput.name + ' ' + mInput.id : '') + ' ' + (liteInput ? liteInput.name + ' ' + liteInput.id : '')).toLowerCase();
+                        const combined = cText + ' ' + attrText;
+
+                        let score = 0;
+                        for (const tw of targetWords) {{
+                            if (['date', 'the', 'of', 'for', 'in', 'and'].includes(tw)) {{
+                                if (combined.includes(tw)) score += 1;
+                            }} else {{
+                                if (combined.includes(tw)) score += 5;
                             }}
                         }}
+
+                        const isTargetBirth = targetWords.some(w => ['birth', 'dob', 'born'].includes(w));
+                        const isContainerBirth = ['birth', 'dob', 'born'].some(w => combined.includes(w));
+                        if (isTargetBirth && isContainerBirth) score += 10;
+                        if (isTargetBirth && !isContainerBirth) score -= 10;
+                        if (!isTargetBirth && isContainerBirth) score -= 10;
+
+                        const isTargetSigned = targetWords.some(w => ['signed', 'signature'].includes(w));
+                        const isContainerSigned = ['signed', 'signature'].some(w => combined.includes(w));
+                        if (isTargetSigned && isContainerSigned) score += 10;
+                        if (isTargetSigned && !isContainerSigned) score -= 10;
+                        if (!isTargetSigned && isContainerSigned) score -= 10;
+
+                        if (score > 0) {{
+                            compositeCandidates.push({{ c, mInput, dInput, yInput, liteInput, score }});
+                        }}
                     }}
+                }}
+            }}
+
+            if (compositeCandidates.length > 0) {{
+                compositeCandidates.sort((a, b) => b.score - a.score);
+                const best = compositeCandidates[0];
+                best.c.scrollIntoView({{block: 'center'}});
+                if (parts) {{
+                    if (best.mInput) {{ best.mInput.value = parts.m; best.mInput.dispatchEvent(new Event('input', {{bubbles: true}})); best.mInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                    if (best.dInput) {{ best.dInput.value = parts.d; best.dInput.dispatchEvent(new Event('input', {{bubbles: true}})); best.dInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                    if (best.yInput) {{ best.yInput.value = parts.y; best.yInput.dispatchEvent(new Event('input', {{bubbles: true}})); best.yInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+                    if (best.liteInput) {{
+                        best.liteInput.value = parts.m + '-' + parts.d + '-' + parts.y;
+                        best.liteInput.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        best.liteInput.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    }}
+                    return 'date_set:' + (best.liteInput ? best.liteInput.value : (parts.y + '-' + parts.m + '-' + parts.d));
                 }}
             }}
 
@@ -1132,20 +1162,21 @@ def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
                 let lbl = '';
                 if (inp.labels && inp.labels[0]) lbl = inp.labels[0].innerText;
                 else if (inp.parentElement) lbl = inp.parentElement.innerText;
-                else if (inp.closest('.form-line')) {{
-                    const l = inp.closest('.form-line').querySelector('label');
-                    if (l) lbl = l.innerText;
-                }}
+                const formLine = inp.closest('.form-line');
+                const lineText = formLine ? (formLine.innerText || '') : '';
                 const ariaLabel = inp.getAttribute('aria-label') || '';
-                const full = (lbl + ' ' + (inp.name || '') + ' ' + (inp.id || '') + ' ' + (inp.value || '') + ' ' + ariaLabel).toLowerCase();
+                const full = (lbl + ' ' + (inp.name || '') + ' ' + (inp.id || '') + ' ' + (inp.value || '') + ' ' + ariaLabel + ' ' + lineText).toLowerCase();
+                const labelText = (lbl + ' ' + (inp.value || '')).toLowerCase();
 
                 let score = 0;
                 targetWords.forEach(w => {{
-                    if (['kyc', 'form', 'preview', 'jotform'].includes(w)) return;
-                    if (full.includes(w)) score += 3;
+                    if (['kyc', 'form', 'preview', 'jotform', 'to', 'be', 'by', 'for', 'of', 'the', 'in', 'and', 'a', 'an'].includes(w)) return;
+                    if (labelText.includes(w)) score += 10;
+                    else if (full.includes(w)) score += 3;
                 }});
                 ['male', 'female', 'single', 'married', 'resident', 'uid', 'passport', 'voter', 'driving', 'telephone', 'electricity', 'gas', 'lease', 'bank', 'ration'].forEach(key => {{
-                    if (target.toLowerCase().includes(key) && full.includes(key)) score += 8;
+                    if (target.toLowerCase().includes(key) && labelText.includes(key)) score += 10;
+                    else if (target.toLowerCase().includes(key) && full.includes(key)) score += 4;
                 }});
                 if (docIdx > 0) score += 2;
 
@@ -1189,21 +1220,23 @@ def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Execute click via Orca CLI
-    print(f"⚡ Executing: orca click --element {ref}")
-    try:
-        run_cmd([ORCA_BIN, "click", "--element", ref])
-    except Exception as e:
-        if not js_toggled:
+    # Execute click via Orca CLI only if not already toggled via DOM injection
+    if not js_toggled:
+        print(f"⚡ Executing: orca click --element {ref}")
+        try:
+            run_cmd([ORCA_BIN, "click", "--element", ref])
+        except Exception as e:
             raise e
-    time.sleep(0.3)
+        time.sleep(0.3)
 
     # Re-inspect post-click state
     new_snapshot = get_orca_snapshot()
     new_pruned = smart_dom_prune(new_snapshot)
     matching_new = [el for el in new_pruned if el["ref"] == ref]
-    final_checked = matching_new[0].get("checked") if matching_new else None
-    if final_checked is None:
+    snap_checked = matching_new[0].get("checked") if matching_new else None
+    if not js_toggled and snap_checked is not None:
+        final_checked = snap_checked
+    elif final_checked is None:
         if action == "check":
             final_checked = True
         elif action == "uncheck":
