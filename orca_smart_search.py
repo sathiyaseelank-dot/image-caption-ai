@@ -836,6 +836,7 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                 const text = (l + ' ' + (s.id || '') + ' ' + (s.className || '') + ' ' + (s.name || '') + ' ' + ariaLabel + ' ' + (s.options[0]?.text || '')).toLowerCase();
                 let score = 0;
                 words.forEach(w => {{
+                    if (['kyc', 'form', 'preview', 'jotform'].includes(w)) return;
                     if (text.includes(w)) {{
                         if (['year', 'month', 'day', 'date'].includes(w)) score += 3;
                         else score += 1;
@@ -908,8 +909,81 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
                     element=name
                 )
             else:
+                dom_fill_js = rf"""
+                (() => {{
+                    const targetName = {json.dumps(name)};
+                    const targetVal = {json.dumps(value)};
+                    const targetWords = targetName.toLowerCase().split(/[\s\-_]+/).filter(Boolean);
+
+                    let allDocs = [document];
+                    document.querySelectorAll('iframe').forEach(f => {{
+                        try {{
+                            const idoc = f.contentDocument || f.contentWindow.document;
+                            if (idoc) allDocs.push(idoc);
+                        }} catch(e) {{}}
+                    }});
+
+                    let best = null;
+                    let bestScore = -1;
+
+                    allDocs.forEach((doc, docIdx) => {{
+                        const inps = Array.from(doc.querySelectorAll('input:not([type=hidden]):not([type=radio]):not([type=checkbox]), textarea'));
+                        inps.forEach(inp => {{
+                            let sublabel = inp.parentElement ? inp.parentElement.innerText : '';
+                            let lineLabel = inp.closest('.form-line') ? (inp.closest('.form-line').querySelector('label') ? inp.closest('.form-line').querySelector('label').innerText : '') : '';
+                            const ariaLabel = inp.getAttribute('aria-label') || '';
+                            const placeholder = inp.placeholder || '';
+                            const fullText = (lineLabel + ' ' + sublabel + ' ' + (inp.name || '') + ' ' + (inp.id || '') + ' ' + ariaLabel + ' ' + placeholder).toLowerCase();
+
+                            let score = 0;
+                            targetWords.forEach(w => {{
+                                if (['kyc', 'form', 'preview', 'jotform'].includes(w)) return;
+                                if (fullText.includes(w)) score += 3;
+                            }});
+
+                            ['first', 'last', 'city', 'state', 'province', 'postal', 'zip', 'street', 'line 2'].forEach(key => {{
+                                if (targetName.toLowerCase().includes(key) && fullText.includes(key)) score += 8;
+                            }});
+
+                            if (docIdx > 0) score += 2;
+
+                            if (ariaLabel && (targetName.toLowerCase().includes(ariaLabel.toLowerCase()) || ariaLabel.toLowerCase().includes(targetName.toLowerCase()))) score += 10;
+                            if (placeholder && targetName.toLowerCase().includes(placeholder.toLowerCase())) score += 5;
+
+                            if (score > bestScore) {{
+                                bestScore = score;
+                                best = inp;
+                            }}
+                        }});
+                    }});
+
+                    if (best && bestScore > 0) {{
+                        best.scrollIntoView({{block: 'center'}});
+                        best.focus();
+                        best.value = targetVal;
+                        best.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        best.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return JSON.stringify({{ found: true, id: best.id, name: best.name, value: best.value }});
+                    }}
+                    return JSON.stringify({{ found: false }});
+                }})()
+                """
+                dom_filled = False
+                try:
+                    res_raw = run_cmd([ORCA_BIN, "eval", "--expression", dom_fill_js])
+                    dom_data = json.loads(res_raw)
+                    if dom_data.get("found"):
+                        dom_filled = True
+                        actual_filled_val = dom_data.get("value", value)
+                except Exception:
+                    pass
+
                 print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
-                run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
+                try:
+                    run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
+                except Exception as e:
+                    if not dom_filled:
+                        raise e
         except OptionUnavailableError:
             raise
         except Exception:
@@ -979,50 +1053,91 @@ def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
             print("=" * 70)
             return {"success": True, "changed": False, "initialState": False, "finalState": False}
 
+    toggle_js = rf"""
+    (() => {{
+        const target = {json.dumps(name)};
+        const action = {json.dumps(action)};
+        const targetWords = target.toLowerCase().split(/[\s\-_]+/).filter(Boolean);
+
+        let allDocs = [document];
+        document.querySelectorAll('iframe').forEach(f => {{
+            try {{
+                const idoc = f.contentDocument || f.contentWindow.document;
+                if (idoc) allDocs.push(idoc);
+            }} catch(e) {{}}
+        }});
+
+        let best = null;
+        let bestScore = -1;
+
+        allDocs.forEach((doc, docIdx) => {{
+            const inputs = Array.from(doc.querySelectorAll('input[type=checkbox], input[type=radio]'));
+            inputs.forEach(inp => {{
+                let lbl = '';
+                if (inp.labels && inp.labels[0]) lbl = inp.labels[0].innerText;
+                else if (inp.parentElement) lbl = inp.parentElement.innerText;
+                else if (inp.closest('.form-line')) {{
+                    const l = inp.closest('.form-line').querySelector('label');
+                    if (l) lbl = l.innerText;
+                }}
+                const ariaLabel = inp.getAttribute('aria-label') || '';
+                const full = (lbl + ' ' + (inp.name || '') + ' ' + (inp.id || '') + ' ' + (inp.value || '') + ' ' + ariaLabel).toLowerCase();
+
+                let score = 0;
+                targetWords.forEach(w => {{
+                    if (['kyc', 'form', 'preview', 'jotform'].includes(w)) return;
+                    if (full.includes(w)) score += 3;
+                }});
+                ['male', 'female', 'single', 'married', 'resident', 'uid', 'passport', 'voter', 'driving', 'telephone', 'electricity', 'gas', 'lease', 'bank', 'ration'].forEach(key => {{
+                    if (target.toLowerCase().includes(key) && full.includes(key)) score += 8;
+                }});
+                if (docIdx > 0) score += 2;
+
+                if (score > bestScore) {{
+                    bestScore = score;
+                    best = inp;
+                }}
+            }});
+        }});
+
+        if (best && bestScore > 0) {{
+            best.scrollIntoView({{block: 'center'}});
+            const init = best.checked;
+            let desiredState = init;
+            if (action === 'check') desiredState = true;
+            else if (action === 'uncheck') desiredState = false;
+            else if (action === 'toggle') desiredState = !init;
+
+            best.checked = desiredState;
+            if (best.labels && best.labels[0]) {{
+                best.labels[0].click();
+            }} else {{
+                best.click();
+            }}
+            best.dispatchEvent(new Event('input', {{bubbles: true}}));
+            best.dispatchEvent(new Event('change', {{bubbles: true}}));
+            return JSON.stringify({{ found: true, id: best.id, name: best.name, checked: best.checked }});
+        }}
+        return JSON.stringify({{ found: false }});
+    }})()
+    """
+    js_toggled = False
+    try:
+        raw_res = run_cmd([ORCA_BIN, "eval", "--expression", toggle_js])
+        t_data = json.loads(raw_res)
+        if t_data.get("found"):
+            js_toggled = True
+            final_checked = t_data.get("checked")
+    except Exception:
+        pass
+
     # Execute click via Orca CLI
     print(f"⚡ Executing: orca click --element {ref}")
     try:
         run_cmd([ORCA_BIN, "click", "--element", ref])
     except Exception as e:
-        err_msg = str(e).lower()
-        if "box model" in err_msg or "cdp error" in err_msg:
-            print(f"⚠️  Direct click hit box model issue, falling back to JS click/toggle for '{name}'...")
-            toggle_js = rf"""
-            (() => {{
-                const target = {json.dumps(name)};
-                const matchAndClick = (doc) => {{
-                    const inputs = Array.from(doc.querySelectorAll('input[type=checkbox], input[type=radio]'));
-                    for (const inp of inputs) {{
-                        const lbl = (inp.labels && inp.labels[0]) ? inp.labels[0].innerText : (inp.parentElement ? inp.parentElement.innerText : '');
-                        const full = (lbl + ' ' + (inp.name || '') + ' ' + (inp.id || '')).toLowerCase();
-                        if (full.includes(target.toLowerCase()) || target.toLowerCase().includes(lbl.toLowerCase())) {{
-                            if (inp.labels && inp.labels[0]) {{
-                                inp.labels[0].click();
-                            }} else {{
-                                inp.click();
-                            }}
-                            return true;
-                        }}
-                    }}
-                    return false;
-                }};
-                if (matchAndClick(document)) return true;
-                const iframes = Array.from(document.querySelectorAll('iframe'));
-                for (const f of iframes) {{
-                    try {{
-                        const idoc = f.contentDocument || f.contentWindow.document;
-                        if (idoc && matchAndClick(idoc)) return true;
-                    }} catch(e) {{}}
-                }}
-                return false;
-            }})()
-            """
-            try:
-                run_cmd([ORCA_BIN, "eval", "--expression", toggle_js])
-            except Exception:
-                raise e
-        else:
-            raise
+        if not js_toggled:
+            raise e
     time.sleep(0.3)
 
     # Re-inspect post-click state
