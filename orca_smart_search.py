@@ -36,7 +36,20 @@ print = print_log
 def emit_json(data: Dict[str, Any]):
     _builtin_print(json.dumps(data, indent=2))
 
-ORCA_BIN = os.environ.get("ORCA_BIN", "/home/inkyank-01/.config/orca/linux-orca-cli-shim/orca")
+def _discover_orca_bin() -> str:
+    env_bin = os.environ.get("ORCA_BIN")
+    if env_bin and os.path.exists(env_bin):
+        return env_bin
+    import shutil
+    which = shutil.which("orca")
+    if which:
+        return which
+    shim = os.path.expanduser("~/.config/orca/linux-orca-cli-shim/orca")
+    if os.path.exists(shim):
+        return shim
+    return "/home/inkyank-01/.config/orca/linux-orca-cli-shim/orca"
+
+ORCA_BIN = _discover_orca_bin()
 # Optional stable browser page id (from `orca tab list --json`) to pin every command to one tab
 # instead of whichever tab happens to be active.
 ORCA_PAGE = os.environ.get("ORCA_PAGE", "").strip()
