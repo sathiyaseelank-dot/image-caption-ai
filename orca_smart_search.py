@@ -949,6 +949,7 @@ def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
 
                             if (ariaLabel && (targetName.toLowerCase().includes(ariaLabel.toLowerCase()) || ariaLabel.toLowerCase().includes(targetName.toLowerCase()))) score += 10;
                             if (placeholder && targetName.toLowerCase().includes(placeholder.toLowerCase())) score += 5;
+                            if (!inp.value || inp.value === '') score += 5;
 
                             if (score > bestScore) {{
                                 bestScore = score;
@@ -1108,12 +1109,14 @@ def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
             else if (action === 'uncheck') desiredState = false;
             else if (action === 'toggle') desiredState = !init;
 
-            best.checked = desiredState;
-            if (best.labels && best.labels[0]) {{
-                best.labels[0].click();
-            }} else {{
-                best.click();
+            if (best.checked !== desiredState) {{
+                if (best.labels && best.labels[0]) {{
+                    best.labels[0].click();
+                }} else {{
+                    best.click();
+                }}
             }}
+            best.checked = desiredState;
             best.dispatchEvent(new Event('input', {{bubbles: true}}));
             best.dispatchEvent(new Event('change', {{bubbles: true}}));
             return JSON.stringify({{ found: true, id: best.id, name: best.name, checked: best.checked }});
