@@ -37,6 +37,9 @@ def emit_json(data: Dict[str, Any]):
     _builtin_print(json.dumps(data, indent=2))
 
 ORCA_BIN = os.environ.get("ORCA_BIN", "/home/inkyank-01/.config/orca/linux-orca-cli-shim/orca")
+# Optional stable browser page id (from `orca tab list --json`) to pin every command to one tab
+# instead of whichever tab happens to be active.
+ORCA_PAGE = os.environ.get("ORCA_PAGE", "").strip()
 
 # Generic role/type keywords that should not by themselves trigger a substantive match
 GENERIC_ROLE_TOKENS = {
@@ -105,6 +108,9 @@ def run_cmd(args: List[str], timeout: float = 15.0) -> str:
             f"Ensure Orca is installed or set the ORCA_BIN environment variable."
         )
 
+    if ORCA_PAGE and args and args[0] == ORCA_BIN and "--page" not in args:
+        args = args + ["--page", ORCA_PAGE]
+
     try:
         res = subprocess.run(
             args,
@@ -123,6 +129,195 @@ def run_cmd(args: List[str], timeout: float = 15.0) -> str:
         raise OrcaError(f"Command failed (exit code {res.returncode}): {err}")
     return res.stdout.strip()
 
+def run_orca_json(args: List[str], timeout: float = 15.0) -> Dict[str, Any]:
+    """Runs a ref-based Orca command in --json mode and returns its 'result' object."""
+    out = run_cmd([ORCA_BIN] + args + ["--json"], timeout=timeout)
+    try:
+        data = json.loads(out)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise OrcaError(f"Orca returned invalid JSON for '{args[0]}': {e}")
+    if not isinstance(data, dict):
+        raise OrcaError(f"Unexpected response from Orca for '{args[0]}'.")
+    if data.get("ok") is False:
+        raise OrcaError(f"Orca '{args[0]}' failed: {data.get('error') or data}")
+    result = data.get("result")
+    return result if isinstance(result, dict) else {}
+
+# Blurs whatever currently has focus (following focus into iframes and shadow roots),
+# so a focus call that silently fails can never leave us acting on the previous field.
+BLUR_ACTIVE_JS = """
+(() => {
+    let el = document.activeElement;
+    let deepest = el;
+    while (el) {
+        deepest = el;
+        let next = null;
+        if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+            try { next = el.contentDocument && el.contentDocument.activeElement; } catch (e) {}
+        } else if (el.shadowRoot) {
+            next = el.shadowRoot.activeElement;
+        }
+        if (!next || next === el) break;
+        el = next;
+    }
+    if (deepest && deepest.blur) deepest.blur();
+    return true;
+})()
+"""
+
+# Inspects (and optionally sets the value of) the element that currently has focus.
+# Combined with `orca focus --element <ref>`, this addresses the exact element behind a
+# snapshot ref on any site, including same-origin iframes and open shadow roots.
+# The element is remembered under a per-action key, so later steps of the same action keep
+# addressing it even if its ref goes stale (e.g. widgets that re-render after a value change).
+BOUND_ELEMENT_JS = """
+(() => {
+    const OP = __OP__;
+    const VALUE = __VALUE__;
+    const MODE = __MODE__;
+    const KEY = __KEY__;
+    const store = window.__orcaSmartBound = window.__orcaSmartBound || {};
+    let el = null;
+    if (MODE === 'stored') {
+        el = store[KEY];
+        if (!el || !el.isConnected) return JSON.stringify({ error: 'no-stored-element' });
+    } else {
+        el = document.activeElement;
+        while (el) {
+            if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+                let inner = null;
+                try { inner = el.contentDocument && el.contentDocument.activeElement; }
+                catch (e) { return JSON.stringify({ error: 'element is inside a cross-origin frame' }); }
+                if (!inner || inner === el) break;
+                el = inner;
+            } else if (el.shadowRoot && el.shadowRoot.activeElement) {
+                el = el.shadowRoot.activeElement;
+            } else {
+                break;
+            }
+        }
+        const doc = el ? el.ownerDocument : null;
+        if (!el || el === doc.body || el === doc.documentElement || el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+            return JSON.stringify({ error: 'element did not receive focus' });
+        }
+        if (KEY) store[KEY] = el;
+    }
+    const tag = el.tagName.toLowerCase();
+
+    if (OP === 'set_value') {
+        if (el.isContentEditable) {
+            el.textContent = VALUE;
+        } else if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+            // Use the native setter so framework-controlled inputs (React, Vue, ...) see the change
+            let proto = Object.getPrototypeOf(el);
+            let desc = null;
+            while (proto && !(desc = Object.getOwnPropertyDescriptor(proto, 'value'))) proto = Object.getPrototypeOf(proto);
+            if (desc && desc.set) desc.set.call(el, VALUE); else el.value = VALUE;
+        } else {
+            return JSON.stringify({ error: 'element is not a fillable field (' + tag + ')' });
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    } else if (OP === 'type_text') {
+        // Simulated keystrokes for masked inputs that rebuild their value from key events
+        const typeable = tag === 'textarea' || (tag === 'input' && ['text', 'search', 'tel', 'url', 'password', ''].includes((el.type || '').toLowerCase()));
+        if (!typeable) {
+            return JSON.stringify({ error: 'element does not support simulated typing (' + tag + ')' });
+        }
+        const win = el.ownerDocument.defaultView;
+        const key = (k, code) => ({ key: k, keyCode: code, which: code, charCode: code, bubbles: true, cancelable: true });
+        el.focus();
+        el.select();
+        el.dispatchEvent(new win.KeyboardEvent('keydown', key('Backspace', 8)));
+        el.setRangeText('', 0, el.value.length, 'end');
+        el.dispatchEvent(new win.InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+        el.dispatchEvent(new win.KeyboardEvent('keyup', key('Backspace', 8)));
+        for (const ch of VALUE) {
+            const opts = key(ch, ch.charCodeAt(0));
+            const down = el.dispatchEvent(new win.KeyboardEvent('keydown', opts));
+            const press = down && el.dispatchEvent(new win.KeyboardEvent('keypress', opts));
+            if (press && el.dispatchEvent(new win.InputEvent('beforeinput', { inputType: 'insertText', data: ch, bubbles: true, cancelable: true }))) {
+                const start = el.selectionStart ?? el.value.length;
+                const end = el.selectionEnd ?? el.value.length;
+                el.setRangeText(ch, start, end, 'end');
+                el.dispatchEvent(new win.InputEvent('input', { inputType: 'insertText', data: ch, bubbles: true }));
+            }
+            el.dispatchEvent(new win.KeyboardEvent('keyup', opts));
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    const info = {
+        tag: tag,
+        type: (el.getAttribute('type') || el.type || '').toLowerCase(),
+        id: el.id || '',
+        name: el.getAttribute('name') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        contentEditable: !!el.isContentEditable,
+        value: el.isContentEditable ? (el.innerText || '') : String(el.value ?? ''),
+        valid: el.validity ? el.validity.valid : true,
+        validationMessage: el.validationMessage || ''
+    };
+    if (tag === 'select') {
+        info.options = Array.from(el.options).map(o => ({ text: (o.text || '').trim(), value: o.value }));
+        info.selectedText = el.selectedIndex >= 0 ? (el.options[el.selectedIndex].text || '').trim() : '';
+    }
+    return JSON.stringify(info);
+})()
+"""
+
+def new_bind_key(ref: str) -> str:
+    """Creates a key that scopes a remembered element to one action on one ref."""
+    return f"{ref}:{time.time_ns()}:{os.getpid()}"
+
+def _run_bound_js(op: str, value: Optional[str], mode: str, key: str) -> Dict[str, Any]:
+    js = (BOUND_ELEMENT_JS
+          .replace("__OP__", json.dumps(op))
+          .replace("__VALUE__", json.dumps(value if value is not None else ""))
+          .replace("__MODE__", json.dumps(mode))
+          .replace("__KEY__", json.dumps(key)))
+    out = run_cmd([ORCA_BIN, "eval", "--expression", js])
+    try:
+        data = json.loads(out)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise OrcaError(f"invalid response ({e})")
+    if not isinstance(data, dict):
+        raise OrcaError("unexpected response")
+    return data
+
+def release_bound_element(key: str):
+    """Forgets an element remembered by bind_element so the page does not keep it alive."""
+    try:
+        run_cmd([ORCA_BIN, "eval", "--expression",
+                 f"(() => {{ if (window.__orcaSmartBound) delete window.__orcaSmartBound[{json.dumps(key)}]; return true; }})()"])
+    except OrcaError:
+        pass
+
+def bind_element(ref: str, op: str = "inspect", value: Optional[str] = None, key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Addresses the exact element behind `ref` and inspects it (op='inspect') or sets its
+    value with native setters + input/change events (op='set_value').
+    With a `key` (see new_bind_key), the element found the first time is reused on later
+    calls; otherwise it is located by blurring the page and focusing the ref via Orca.
+    Raises OrcaError if the exact element cannot be addressed.
+    """
+    if key:
+        data = _run_bound_js(op, value, "stored", key)
+        if data.get("error") != "no-stored-element":
+            if data.get("error"):
+                raise OrcaError(f"Could not address element [{ref}] in the page: {data['error']}")
+            return data
+
+    try:
+        run_cmd([ORCA_BIN, "eval", "--expression", BLUR_ACTIVE_JS])
+    except OrcaError:
+        pass
+    run_orca_json(["focus", "--element", ref])
+    data = _run_bound_js(op, value, "focused", key or "")
+    if data.get("error"):
+        raise OrcaError(f"Could not address element [{ref}] in the page: {data['error']}")
+    return data
+
 def get_orca_snapshot() -> Dict[str, Any]:
     out = run_cmd([ORCA_BIN, "snapshot", "--json"])
     try:
@@ -133,23 +328,41 @@ def get_orca_snapshot() -> Dict[str, Any]:
     if not isinstance(data, dict) or "result" not in data:
         raise OrcaError(f"Unexpected snapshot structure from Orca: missing 'result' object.")
 
-    # Automatically enrich unlabelled inputs with surrounding DOM labels (e.g. table/bootstrap layouts)
+    # Automatically enrich unlabelled inputs with surrounding DOM labels (e.g. table/bootstrap layouts).
+    # Refs are matched to DOM fields by document order, so only refs and fields that both lack an
+    # accessible name take part, and labels are applied only when the two lists line up exactly.
     refs = data.get("result", {}).get("refs", {})
+    snapshot_text = data.get("result", {}).get("snapshot", "") or ""
+    ref_order = re.findall(r'ref=(e\d+)', snapshot_text)
     unlabelled_refs = [
-        ref_id for ref_id, info in refs.items()
-        if info.get("role") in ["textbox", "combobox", "searchbox", "search"] and not info.get("name", "").strip()
+        ref_id for ref_id in dict.fromkeys(ref_order)
+        if ref_id in refs
+        and refs[ref_id].get("role") in ["textbox", "combobox", "searchbox", "search"]
+        and not refs[ref_id].get("name", "").strip()
     ]
 
     if unlabelled_refs:
         js = """
         (() => {
-            const inputs = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"));
-            return inputs.map((el, i) => {
+            const SKIP_TYPES = ['hidden', 'checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'file', 'range', 'color'];
+            const fields = [];
+            const walk = (doc) => {
+                doc.querySelectorAll("input, select, textarea, iframe, frame").forEach(el => {
+                    if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+                        try { if (el.contentDocument) walk(el.contentDocument); } catch (e) {}
+                        return;
+                    }
+                    if (el.tagName === 'INPUT' && SKIP_TYPES.includes((el.type || '').toLowerCase())) return;
+                    if (el.getClientRects().length === 0) return;
+                    const hasName = (el.labels && el.labels.length > 0) || el.getAttribute('aria-label') ||
+                        el.getAttribute('aria-labelledby') || el.getAttribute('title') || el.getAttribute('placeholder');
+                    if (!hasName) fields.push(el);
+                });
+            };
+            walk(document);
+            return fields.map((el, i) => {
                 let label = "";
-                if (el.labels && el.labels[0]) label = el.labels[0].innerText.trim();
-                else if (el.getAttribute("aria-label")) label = el.getAttribute("aria-label").trim();
-                else if (el.placeholder) label = el.placeholder.trim();
-                else if (el.parentElement && el.parentElement.previousElementSibling) {
+                if (el.parentElement && el.parentElement.previousElementSibling) {
                     const prev = el.parentElement.previousElementSibling.innerText.trim();
                     if (prev.length < 50) label = prev;
                 }
@@ -180,9 +393,9 @@ def get_orca_snapshot() -> Dict[str, Any]:
         try:
             dom_out = run_cmd([ORCA_BIN, "eval", "--expression", js])
             dom_labels = json.loads(dom_out)
-            for i, ref_id in enumerate(unlabelled_refs):
-                if i < len(dom_labels):
-                    lbl = dom_labels[i].get("resolvedLabel")
+            if isinstance(dom_labels, list) and len(dom_labels) == len(unlabelled_refs):
+                for ref_id, dom_label in zip(unlabelled_refs, dom_labels):
+                    lbl = dom_label.get("resolvedLabel")
                     if lbl:
                         refs[ref_id]["name"] = lbl
         except Exception:
@@ -201,69 +414,94 @@ def get_page_verification_state() -> Dict[str, Any]:
     """
     js_code = """
     (() => {
-        // 1. Detect HTML5 invalid form inputs
+        // Collect the top document plus every same-origin frame (embedded forms live in iframes)
+        const docs = [];
+        const walk = (doc) => {
+            docs.push(doc);
+            doc.querySelectorAll('iframe, frame').forEach(f => {
+                try { if (f.contentDocument && f.contentDocument.body) walk(f.contentDocument); } catch (e) {}
+            });
+        };
+        walk(document);
+
         const invalidInputs = [];
-        document.querySelectorAll('input, select, textarea').forEach(el => {
-            if (el.checkValidity && !el.checkValidity()) {
+        const alerts = [];
+        const dialogs = [];
+        const formValues = {};
+        const texts = [];
+
+        docs.forEach((doc, docIdx) => {
+            const win = doc.defaultView;
+            const prefix = docIdx > 0 ? 'frame' + docIdx + ':' : '';
+
+            // 1. Detect HTML5 invalid form inputs (validity is read without firing 'invalid' events)
+            doc.querySelectorAll('input, select, textarea').forEach(el => {
+                if (el.validity && !el.validity.valid) {
+                    let label = '';
+                    if (el.labels && el.labels[0]) label = el.labels[0].innerText.trim();
+                    else if (el.closest('label')) label = el.closest('label').innerText.trim();
+                    else label = el.getAttribute('aria-label') || el.placeholder || el.name || el.id;
+
+                    invalidInputs.push({
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || '',
+                        name: el.name || '',
+                        label: label,
+                        validationMessage: el.validationMessage || 'Invalid field'
+                    });
+                }
+            });
+
+            // 2. Detect visible error banners, alerts, toasts
+            doc.querySelectorAll(
+                '[role="alert"], [role="status"], [aria-live="assertive"], .alert, .error, .error-message, .invalid-feedback, .toast, .notice, .alert-banner'
+            ).forEach(el => {
+                if (el.offsetParent !== null) { // visible only
+                    const txt = el.innerText.trim();
+                    if (txt && !alerts.includes(txt) && txt.length < 300) {
+                        alerts.push(txt);
+                    }
+                }
+            });
+
+            // 3. Detect open modal dialogs
+            doc.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], .modal.show').forEach(d => {
+                const isNativeDialogOpen = d.tagName.toLowerCase() === 'dialog' && d.open;
+                const isVisibleAriaDialog = d.offsetParent !== null && win.getComputedStyle(d).display !== 'none';
+                if (isNativeDialogOpen || isVisibleAriaDialog) {
+                    const titleEl = d.querySelector('h1, h2, h3, .modal-title, [id*="title"]');
+                    const title = titleEl ? titleEl.innerText.trim() : (d.id || 'Active Dialog');
+                    dialogs.push(title);
+                }
+            });
+
+            // 4. Capture snapshot of all form input values
+            doc.querySelectorAll('input:not([type=hidden]), select, textarea').forEach((el, idx) => {
                 let label = '';
                 if (el.labels && el.labels[0]) label = el.labels[0].innerText.trim();
-                else if (el.closest('label')) label = el.closest('label').innerText.trim();
-                else label = el.getAttribute('aria-label') || el.placeholder || el.name || el.id;
+                else if (el.parentElement && el.parentElement.previousElementSibling) label = el.parentElement.previousElementSibling.innerText.trim();
+                let key = prefix + (label || el.name || el.id || ('field_' + idx));
+                if (key in formValues) key += '#' + idx;
+                const val = (el.type === 'checkbox' || el.type === 'radio') ? el.checked : el.value;
+                formValues[key] = String(val);
+            });
 
-                invalidInputs.push({
-                    tag: el.tagName.toLowerCase(),
-                    id: el.id || '',
-                    name: el.name || '',
-                    label: label,
-                    validationMessage: el.validationMessage || 'Invalid field'
-                });
-            }
+            texts.push(doc.body ? doc.body.innerText.trim() : '');
         });
 
-        // 2. Detect visible error banners, alerts, toasts
-        const alerts = [];
-        const alertElements = document.querySelectorAll(
-            '[role="alert"], [role="status"], [aria-live="assertive"], .alert, .error, .error-message, .invalid-feedback, .toast, .notice, .alert-banner'
-        );
-        alertElements.forEach(el => {
-            if (el.offsetParent !== null) { // visible only
-                const txt = el.innerText.trim();
-                if (txt && !alerts.includes(txt) && txt.length < 300) {
-                    alerts.push(txt);
-                }
-            }
-        });
-
-        // 3. Detect open modal dialogs
-        const dialogs = [];
-        document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], .modal.show').forEach(d => {
-            const isNativeDialogOpen = d.tagName.toLowerCase() === 'dialog' && d.open;
-            const isVisibleAriaDialog = d.offsetParent !== null && window.getComputedStyle(d).display !== 'none';
-            if (isNativeDialogOpen || isVisibleAriaDialog) {
-                const titleEl = d.querySelector('h1, h2, h3, .modal-title, [id*="title"]');
-                const title = titleEl ? titleEl.innerText.trim() : (d.id || 'Active Dialog');
-                dialogs.push(title);
-            }
-        });
-
-        // 4. Capture snapshot of all form input values
-        const formValues = {};
-        document.querySelectorAll('input:not([type=hidden]), select, textarea').forEach((el, idx) => {
-            let label = '';
-            if (el.labels && el.labels[0]) label = el.labels[0].innerText.trim();
-            else if (el.parentElement && el.parentElement.previousElementSibling) label = el.parentElement.previousElementSibling.innerText.trim();
-            const key = label || el.name || el.id || ('field_' + idx);
-            const val = (el.type === 'checkbox' || el.type === 'radio') ? el.checked : el.value;
-            formValues[key] = String(val);
-        });
-
-        const bodyTxt = document.body ? document.body.innerText.trim() : '';
+        const bodyTxt = texts.join('\\n');
+        let hash = 2166136261;
+        for (let i = 0; i < bodyTxt.length; i++) {
+            hash ^= bodyTxt.charCodeAt(i);
+            hash = Math.imul(hash, 16777619) >>> 0;
+        }
 
         return {
             url: window.location.href,
             title: document.title || 'Untitled',
             bodyText: bodyTxt.slice(0, 5000),
             bodyLength: bodyTxt.length,
+            bodyHash: hash.toString(16),
             formValues: formValues,
             invalidInputs: invalidInputs,
             alerts: alerts,
@@ -337,8 +575,11 @@ def compare_page_states(before: Dict[str, Any], after: Dict[str, Any], is_submit
     dialog_opened = len(after_dialogs) > len(before_dialogs)
     dialog_closed = len(after_dialogs) < len(before_dialogs)
 
-    # Detect content text change
-    content_changed = before.get("bodyText") != after.get("bodyText")
+    # Detect content text change (full-text hash when available, covering text beyond the 5000-char excerpt)
+    if before.get("bodyHash") and after.get("bodyHash"):
+        content_changed = before["bodyHash"] != after["bodyHash"]
+    else:
+        content_changed = before.get("bodyText") != after.get("bodyText")
 
     # Detect form input values change (e.g. Reset button cleared fields or Autofill populated fields)
     before_forms = before.get("formValues", {})
@@ -470,7 +711,7 @@ def parse_date_value(val: str) -> Optional[str]:
     if year and month and day:
         return f"{year}-{month}-{day}"
 
-    slash_match = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', val)
+    slash_match = re.search(r'(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})', val)
     if slash_match:
         p1, p2, p3 = slash_match.groups()
         if int(p1) > 12:
@@ -480,6 +721,39 @@ def parse_date_value(val: str) -> Optional[str]:
         else:
             return f"{p3}-{int(p2):02d}-{int(p1):02d}"
 
+    return None
+
+def format_date_for_field(iso_date: str, field: Dict[str, Any], raw_value: Optional[str] = None) -> Optional[str]:
+    """
+    Formats a YYYY-MM-DD date the way the target field expects it, based on the field's
+    input type (native date pickers) or a date-pattern placeholder such as 'MM-DD-YYYY'.
+    A raw value that is already written in the placeholder's format is kept as-is.
+    Returns None when the field gives no indication that it is a date field.
+    """
+    year, month, day = iso_date.split("-")
+    field_type = (field.get("type") or "").lower()
+    if field_type == "date":
+        return iso_date
+    if field_type == "datetime-local":
+        return f"{iso_date}T00:00"
+    if field_type == "month":
+        return f"{year}-{month}"
+
+    placeholder = (field.get("placeholder") or "").strip().upper()
+    m = re.fullmatch(r'(MM|DD|YYYY)([-/. ])(MM|DD|YYYY)\2(MM|DD|YYYY)', placeholder)
+    if m and sorted([m.group(1), m.group(3), m.group(4)]) == ["DD", "MM", "YYYY"]:
+        order = (m.group(1), m.group(3), m.group(4))
+        # A numeric date already written in the field's own order is read in that order,
+        # whatever separator was used (so 03/04/2020 and 03-04-2020 mean the same date)
+        raw_match = re.fullmatch(r'(\d{1,4})[-/.](\d{1,4})[-/.](\d{1,4})', (raw_value or "").strip())
+        if raw_match:
+            raw_parts = dict(zip(order, raw_match.groups()))
+            if (len(raw_parts["YYYY"]) == 4 and len(raw_parts["MM"]) <= 2 and len(raw_parts["DD"]) <= 2
+                    and 1 <= int(raw_parts["MM"]) <= 12 and 1 <= int(raw_parts["DD"]) <= 31):
+                parts = {"YYYY": raw_parts["YYYY"], "MM": raw_parts["MM"].zfill(2), "DD": raw_parts["DD"].zfill(2)}
+                return m.group(2).join(parts[g] for g in order)
+        parts = {"YYYY": year, "MM": month, "DD": day}
+        return m.group(2).join(parts[g] for g in (m.group(1), m.group(3), m.group(4)))
     return None
 
 def extract_snapshot_metadata(snapshot_text: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, bool], Dict[str, bool]]:
@@ -502,18 +776,20 @@ def extract_snapshot_metadata(snapshot_text: str) -> Tuple[Dict[str, str], Dict[
         if current_label and ("StaticText" in line or "Label" in line):
             last_label = current_label
 
-        m_ref = re.search(r'\[(?:[^\]]*ref=)?(e\d+)\](?::\s*(.+))?', line)
+        # Attributes live only in the bracket that holds the ref, e.g. [checked=false, disabled, ref=e3];
+        # the quoted element name is never inspected, so a label like "Show disabled items" is not a flag.
+        m_ref = re.search(r'\[([^\[\]]*?)(?:ref=)?(e\d+)\](?::\s*(.+))?', line)
         if m_ref:
-            ref_id = m_ref.group(1)
-            val = m_ref.group(2)
+            ref_id = m_ref.group(2)
+            val = m_ref.group(3)
             if val:
                 ref_values[ref_id] = val.strip()
-            bracket_content = line.split("]")[0]
-            if "disabled" in bracket_content:
+            attrs = {a.strip().lower() for a in m_ref.group(1).split(",") if a.strip()}
+            if "disabled" in attrs or "disabled=true" in attrs:
                 ref_disabled[ref_id] = True
-            if "checked=true" in bracket_content:
+            if "checked" in attrs or "checked=true" in attrs:
                 ref_checked[ref_id] = True
-            elif "checked=false" in bracket_content:
+            elif "checked=false" in attrs:
                 ref_checked[ref_id] = False
             ancestors = [item[1] for item in stack if item[1]]
             context = " ".join(ancestors) if ancestors else last_label
@@ -550,7 +826,12 @@ def smart_dom_prune(snapshot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         inline_val = ref_values.get(ref_id, "")
         context = ref_contexts.get(ref_id, "")
 
-        if inline_val and inline_val.lower() not in name.lower():
+        if role == "spinbutton" and context and context.lower() not in name.lower():
+            # Native date/time inputs are exposed only as Month/Day/Year spinbuttons;
+            # their label lives in the surrounding context, so keep it in the name.
+            display_name = f"{context} {name}".strip()
+            semantic_text = f"{context} {name} {role}".strip()
+        elif inline_val and inline_val.lower() not in name.lower():
             display_name = f"{name} ({inline_val})".strip()
             semantic_text = f"{context} {name} {inline_val} {role}".strip()
         elif context and context.lower() not in name.lower():
@@ -663,20 +944,26 @@ def compute_semantic_score(query: str, element: Dict[str, Any]) -> float:
     score *= length_penalty
     return round(score, 3)
 
-def resolve_target_element(target: str, confidence_threshold: float = 1.0) -> Tuple[str, Dict[str, Any]]:
+def resolve_target_element(target: str, confidence_threshold: float = 1.0, require: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """
     Resolves target query to element ref.
     Guards against ambiguity when multiple elements have similar high scores.
+    `require` restricts semantic matches to one kind of element ('is_input' for fills,
+    'is_checkable' for checkboxes/radios); direct refs are always honoured.
     """
     clean = target.strip().lstrip("@")
     snapshot = get_orca_snapshot()
     refs = snapshot.get("result", {}).get("refs", {})
 
-    # Direct ref check (e.g. 'e3')
+    pruned = smart_dom_prune(snapshot)
+
+    # Direct ref check (e.g. 'e3'); prefer the pruned entry so disabled/checked state is kept
     if clean in refs:
+        for el in pruned:
+            if el["ref"] == clean:
+                return clean, el
         return clean, refs[clean]
 
-    pruned = smart_dom_prune(snapshot)
     scored = []
     for el in pruned:
         score = compute_semantic_score(target, el)
@@ -687,6 +974,18 @@ def resolve_target_element(target: str, confidence_threshold: float = 1.0) -> Tu
         raise ElementNotFoundError(f"Could not find any element matching query: '{target}'", target=target)
 
     scored.sort(key=lambda x: x[0], reverse=True)
+
+    if require:
+        kind_matches = [(s, el) for s, el in scored if el.get(require)]
+        if not kind_matches:
+            kind_desc = "input field" if require == "is_input" else "checkbox, radio, or switch"
+            closest = scored[0][1]
+            raise ElementNotFoundError(
+                f"Could not find any {kind_desc} matching query: '{target}' "
+                f"(closest match is [{closest['ref']}] \"{closest['name']}\" ({closest['role']}))",
+                target=target
+            )
+        scored = kind_matches
 
     # Ambiguity check: if top 2 candidates have distinct names and near-identical scores
     if len(scored) >= 2:
@@ -723,24 +1022,9 @@ def act_click_and_verify(target: str, wait_seconds: float = 1.0) -> Dict[str, An
     # Check if this is a submission action
     is_submit = "submit" in target.lower() or "submit" in name.lower() or "save" in target.lower()
 
-    # Auto-scroll element into view so clicks never miss off-screen elements
-    scroll_js = f"""
-    (() => {{
-        const target = {json.dumps(name)};
-        const candidates = Array.from(document.querySelectorAll('button, input, a, select, textarea, [role=button], [role=combobox]'));
-        const match = candidates.find(el => {{
-            const txt = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().toLowerCase();
-            return txt === target.toLowerCase() || txt.includes(target.toLowerCase());
-        }});
-        if (match) {{
-            match.scrollIntoView({{block: 'center', inline: 'center'}});
-            return true;
-        }}
-        return false;
-    }})()
-    """
+    # Auto-scroll the exact element into view so clicks never miss off-screen elements
     try:
-        run_cmd([ORCA_BIN, "eval", "--expression", scroll_js])
+        run_cmd([ORCA_BIN, "scrollintoview", "--element", ref])
         time.sleep(0.2)
     except Exception:
         pass
@@ -757,509 +1041,297 @@ def act_click_and_verify(target: str, wait_seconds: float = 1.0) -> Dict[str, An
     print_verification_report(comparison)
     return comparison
 
+def _values_match(expected: str, actual: Optional[str]) -> bool:
+    """Loose comparison that tolerates input masks / formatting (e.g. '(987) 654-3210' vs '9876543210')."""
+    if actual is None:
+        return False
+    if expected == actual:
+        return True
+    norm_expected = re.sub(r'[^0-9a-z]', '', expected.lower())
+    norm_actual = re.sub(r'[^0-9a-z]', '', actual.lower())
+    return norm_expected != "" and norm_expected == norm_actual
+
+def _read_value(ref: str) -> Optional[str]:
+    try:
+        val = run_orca_json(["get", "--element", ref, "--what", "value"]).get("value")
+        return val if isinstance(val, str) else None
+    except OrcaError:
+        return None
+
+def _match_select_option(options: List[Dict[str, str]], desired: str) -> Optional[Dict[str, str]]:
+    """Finds a dropdown option by exact text, then exact value, then text prefix (case-insensitive)."""
+    wanted = desired.strip().lower()
+    for key in ("text", "value"):
+        for opt in options:
+            if (opt.get(key) or "").strip().lower() == wanted:
+                return opt
+    if wanted:
+        for opt in options:
+            if (opt.get("text") or "").strip().lower().startswith(wanted):
+                return opt
+    return None
+
+def _fill_select(ref: str, name: str, value: str, field: Dict[str, Any], key: Optional[str] = None) -> Dict[str, Any]:
+    """Selects an option in a native <select> and verifies the selection on the element itself."""
+    options = field.get("options", [])
+    opt = _match_select_option(options, value)
+    if not opt:
+        avail = [o.get("text") or o.get("value") for o in options if (o.get("text") or o.get("value"))]
+        avail_str = ", ".join(avail[:10]) + ("..." if len(avail) > 10 else "")
+        print(f"\n❌ OPTION UNAVAILABLE: Option \"{value}\" is not available for \"{name}\".")
+        print(f"   Available options ({len(avail)}): [{avail_str}]")
+        raise OptionUnavailableError(
+            f"Option '{value}' is not available in dropdown '{name}'. "
+            f"Available options are: [{avail_str}]",
+            available_options=avail,
+            target=value,
+            element=name
+        )
+
+    def is_selected(state: Dict[str, Any]) -> bool:
+        return state.get("value") == opt["value"] and state.get("selectedText") == opt["text"]
+
+    select_value = opt["value"] or opt["text"]
+    print(f"⚡ Executing: orca select --element {ref} --value \"{select_value}\"")
+    try:
+        run_orca_json(["select", "--element", ref, "--value", select_value])
+    except OrcaError as e:
+        print(f"   ↪ orca select failed ({e})")
+
+    after = bind_element(ref, key=key)
+    if not is_selected(after):
+        print("   ↪ Selection did not take effect; setting the option directly on the element")
+        after = bind_element(ref, op="set_value", value=opt["value"], key=key)
+        if not is_selected(after):
+            raise OrcaError(
+                f"Could not select '{opt['text']}' in [{ref}] \"{name}\": "
+                f"the field shows '{after.get('selectedText')}'."
+            )
+    print(f"⚡ Selected dropdown option: \"{opt['text']}\"")
+    return after
+
+def _fill_text(ref: str, value: str, field: Optional[Dict[str, Any]], key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Fills a text-like field via Orca, then reads the value back from the same element.
+    If the value did not stick (some iframes / custom widgets ignore Orca's fill), it is set
+    directly on the exact element. Raises OrcaError if the field still does not hold the value.
+    """
+    print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
+    fill_error = None
+    try:
+        run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
+    except OrcaError as e:
+        fill_error = e
+
+    if field is None:
+        # The element could not be addressed in the page; rely on Orca's own read-back
+        if fill_error:
+            raise fill_error
+        actual = _read_value(ref)
+        if actual is not None and not _values_match(value, actual):
+            raise OrcaError(f"Value did not stick in [{ref}]: the field shows '{actual}'.")
+        return {"value": actual if actual is not None else value}
+
+    after = _inspect_or_read(ref, key)
+    if _values_match(value, after.get("value")):
+        return after
+
+    print("   ↪ orca fill did not take effect; setting the value directly on the element")
+    try:
+        after = bind_element(ref, op="set_value", value=value, key=key)
+    except OrcaError as e:
+        # Some widgets (e.g. native date segments) briefly refuse focus right after a fill;
+        # the earlier fill may also have landed late, so re-check before giving up.
+        time.sleep(0.3)
+        after = _inspect_or_read(ref, key)
+        if not _values_match(value, after.get("value")):
+            raise e
+    if _values_match(value, after.get("value")):
+        return after
+
+    # Masked inputs (dates, phone numbers, ...) rebuild their value from keystrokes
+    print("   ↪ Field rewrote the value (input mask?); typing it key by key instead")
+    after = bind_element(ref, op="type_text", value=value, key=key)
+    if not _values_match(value, after.get("value")):
+        raise OrcaError(f"Value did not stick in [{ref}]: the field shows '{after.get('value')}'.")
+    return after
+
+def _inspect_or_read(ref: str, key: Optional[str] = None) -> Dict[str, Any]:
+    """Inspects the exact element, falling back to Orca's own value read-back."""
+    try:
+        return bind_element(ref, key=key)
+    except OrcaError:
+        return {"value": _read_value(ref)}
+
 def act_fill_and_verify(target: str, value: str) -> Dict[str, Any]:
     print(f"\n🎯 Finding target field for fill: '{target}'...")
-    ref, info = resolve_target_element(target)
+    ref, info = resolve_target_element(target, require="is_input")
     name = info.get("name") or info.get("role")
     role = info.get("role", "")
     print(f"👉 Matched input field: [{ref}] \"{name}\" ({role})")
 
-    parsed_date = parse_date_value(value)
-    date_handled = False
-    actual_filled_val = value
-
-    # Smart date input handler (supports native datepickers, spinbuttons, and natural date strings)
-    if parsed_date or role in ["spinbutton", "date"] or any(k in str(name).lower() for k in ["date", "dob", "birth", "month", "year"]):
-        iso_val = parsed_date or value
-        date_js = rf"""
-        (() => {{
-            const targetName = {json.dumps(name or "")};
-            const targetQuery = {json.dumps(target)};
-            const rawVal = {json.dumps(value)};
-            const isoVal = {json.dumps(iso_val)};
-            const targetWords = (targetName + ' ' + targetQuery).toLowerCase().split(/[\s\-_]+/).filter(Boolean);
-
-            let allDocs = [document];
-            document.querySelectorAll('iframe').forEach(f => {{
-                try {{
-                    const idoc = f.contentDocument || f.contentWindow.document;
-                    if (idoc) allDocs.push(idoc);
-                }} catch(e) {{}}
-            }});
-
-            let parts = null;
-            const mMatch = rawVal.match(/(\d{{4}})[-\/](\d{{1,2}})[-\/](\d{{1,2}})/);
-            const dMatch = rawVal.match(/(\d{{1,2}})[-\/](\d{{1,2}})[-\/](\d{{4}})/);
-            if (mMatch) {{
-                parts = {{ y: mMatch[1], m: mMatch[2].padStart(2, '0'), d: mMatch[3].padStart(2, '0') }};
-            }} else if (dMatch) {{
-                parts = {{ m: dMatch[1].padStart(2, '0'), d: dMatch[2].padStart(2, '0'), y: dMatch[3] }};
-            }}
-
-            let compositeCandidates = [];
-            for (const doc of allDocs) {{
-                const containers = Array.from(doc.querySelectorAll('.form-line, .form-input-wide, fieldset, [role="group"]'));
-                for (const c of containers) {{
-                    const mInput = c.querySelector('input[id*="month"], input[name*="month"]');
-                    const dInput = c.querySelector('input[id*="day"], input[name*="day"]');
-                    const yInput = c.querySelector('input[id*="year"], input[name*="year"]');
-                    const liteInput = c.querySelector('input[id*="lite_mode"], input[name*="lite_mode"], input[placeholder*="YYYY"], input[placeholder*="MM"]');
-
-                    if ((mInput && dInput && yInput) || liteInput) {{
-                        const cText = (c.innerText || '').toLowerCase();
-                        const attrText = (c.id + ' ' + (mInput ? mInput.name + ' ' + mInput.id : '') + ' ' + (liteInput ? liteInput.name + ' ' + liteInput.id : '')).toLowerCase();
-                        const combined = cText + ' ' + attrText;
-
-                        let score = 0;
-                        for (const tw of targetWords) {{
-                            if (['date', 'the', 'of', 'for', 'in', 'and'].includes(tw)) {{
-                                if (combined.includes(tw)) score += 1;
-                            }} else {{
-                                if (combined.includes(tw)) score += 5;
-                            }}
-                        }}
-
-                        const isTargetBirth = targetWords.some(w => ['birth', 'dob', 'born'].includes(w));
-                        const isContainerBirth = ['birth', 'dob', 'born'].some(w => combined.includes(w));
-                        if (isTargetBirth && isContainerBirth) score += 10;
-                        if (isTargetBirth && !isContainerBirth) score -= 10;
-                        if (!isTargetBirth && isContainerBirth) score -= 10;
-
-                        const isTargetSigned = targetWords.some(w => ['signed', 'signature'].includes(w));
-                        const isContainerSigned = ['signed', 'signature'].some(w => combined.includes(w));
-                        if (isTargetSigned && isContainerSigned) score += 10;
-                        if (isTargetSigned && !isContainerSigned) score -= 10;
-                        if (!isTargetSigned && isContainerSigned) score -= 10;
-
-                        if (score > 0) {{
-                            compositeCandidates.push({{ c, mInput, dInput, yInput, liteInput, score }});
-                        }}
-                    }}
-                }}
-            }}
-
-            if (compositeCandidates.length > 0) {{
-                compositeCandidates.sort((a, b) => b.score - a.score);
-                const best = compositeCandidates[0];
-                best.c.scrollIntoView({{block: 'center'}});
-                if (parts) {{
-                    if (best.mInput) {{ best.mInput.value = parts.m; best.mInput.dispatchEvent(new Event('input', {{bubbles: true}})); best.mInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                    if (best.dInput) {{ best.dInput.value = parts.d; best.dInput.dispatchEvent(new Event('input', {{bubbles: true}})); best.dInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                    if (best.yInput) {{ best.yInput.value = parts.y; best.yInput.dispatchEvent(new Event('input', {{bubbles: true}})); best.yInput.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-                    if (best.liteInput) {{
-                        best.liteInput.value = parts.m + '-' + parts.d + '-' + parts.y;
-                        best.liteInput.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        best.liteInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    }}
-                    return 'date_set:' + (best.liteInput ? best.liteInput.value : (parts.y + '-' + parts.m + '-' + parts.d));
-                }}
-            }}
-
-            for (const doc of allDocs) {{
-                const dateInputs = Array.from(doc.querySelectorAll('input[type="date"], input[type="datetime-local"]'));
-                if (dateInputs.length > 0) {{
-                    let bestInput = dateInputs[0];
-                    if (dateInputs.length > 1) {{
-                        const q = (targetName + ' ' + targetQuery).toLowerCase();
-                        dateInputs.forEach(inp => {{
-                            let label = '';
-                            if (inp.labels && inp.labels[0]) label = inp.labels[0].innerText;
-                            else if (inp.closest('label')) label = inp.closest('label').innerText;
-                            const combined = (label + ' ' + inp.name + ' ' + inp.id).toLowerCase();
-                            if (q.split(/\s+/).some(w => combined.includes(w))) bestInput = inp;
-                        }});
-                    }}
-                    bestInput.scrollIntoView({{block: 'center'}});
-                    bestInput.value = isoVal;
-                    bestInput.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    bestInput.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return 'date_set:' + bestInput.value;
-                }}
-            }}
-
-            return 'no_date_inputs';
-        }})()
-        """
-        try:
-            date_res = run_cmd([ORCA_BIN, "eval", "--expression", date_js])
-            if "date_set:" in date_res:
-                actual_date = date_res.split("date_set:")[1]
-                print(f"⚡ Set date field: \"{actual_date}\"")
-                date_handled = True
-                actual_filled_val = actual_date
-        except Exception:
-            pass
-
-    if not date_handled:
-        # If target is a dropdown / combobox / select, handle text-to-value resolution
-        select_js = rf"""
-        (() => {{
-            const targetName = {json.dumps(name)};
-            const desiredVal = {json.dumps(value)};
-            const target = targetName.toLowerCase();
-            const desired = desiredVal.toLowerCase();
-            const words = target.split(/[\s\-_]+/).filter(Boolean);
-            const selects = [];
-            try {{
-                selects.push(...Array.from(document.querySelectorAll('select')));
-                document.querySelectorAll('iframe').forEach(f => {{
-                    try {{
-                        const idoc = f.contentDocument || f.contentWindow.document;
-                        if (idoc) selects.push(...Array.from(idoc.querySelectorAll('select')));
-                    }} catch(e) {{}}
-                }});
-            }} catch(e) {{}}
-            
-            let bestSelect = null;
-            let bestScore = -1;
-            
-            selects.forEach(s => {{
-                let l = '';
-                if (s.labels && s.labels[0]) l = s.labels[0].innerText;
-                else if (s.parentElement && s.parentElement.previousElementSibling) l = s.parentElement.previousElementSibling.innerText;
-                const ariaLabel = (s.getAttribute('aria-label') || '').toLowerCase();
-                const text = (l + ' ' + (s.id || '') + ' ' + (s.className || '') + ' ' + (s.name || '') + ' ' + ariaLabel + ' ' + (s.options[0]?.text || '')).toLowerCase();
-                let score = 0;
-                words.forEach(w => {{
-                    if (['kyc', 'form', 'preview', 'jotform'].includes(w)) return;
-                    if (text.includes(w)) {{
-                        if (['year', 'month', 'day', 'date'].includes(w)) score += 3;
-                        else score += 1;
-                    }}
-                }});
-
-                if (ariaLabel && (target.includes(ariaLabel) || ariaLabel.includes(target))) {{
-                    score += 10;
-                }}
-
-                const exactTextMatch = Array.from(s.options).some(o => (o.text || '').trim().toLowerCase() === desired);
-                const valueMatch = Array.from(s.options).some(o => (o.value || '').trim().toLowerCase() === desired);
-                if (exactTextMatch) score += 10;
-                else if (valueMatch) score += 3;
-
-                if (score > bestScore) {{
-                    bestScore = score;
-                    bestSelect = s;
-                }}
-            }});
-
-            if (bestSelect && bestScore > 0) {{
-                bestSelect.scrollIntoView({{block: 'center'}});
-                const allOpts = Array.from(bestSelect.options).map(o => (o.text || o.value || '').trim()).filter(Boolean);
-                const opt = Array.from(bestSelect.options).find(o => 
-                    o.text.trim().toLowerCase() === desired
-                ) || Array.from(bestSelect.options).find(o => 
-                    o.value.trim().toLowerCase() === desired ||
-                    o.text.trim().toLowerCase().startsWith(desired)
-                );
-                if (opt) {{
-                    bestSelect.value = opt.value;
-                    bestSelect.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    bestSelect.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return JSON.stringify({{
-                        status: 'selected',
-                        selected: opt.text,
-                        value: opt.value
-                    }});
-                }} else {{
-                    return JSON.stringify({{
-                        status: 'unavailable',
-                        requested: desiredVal,
-                        available: allOpts.slice(0, 15),
-                        total: allOpts.length
-                    }});
-                }}
-            }}
-            return JSON.stringify({{ status: 'standard' }});
-        }})()
-        """
-        try:
-            res_raw = run_cmd([ORCA_BIN, "eval", "--expression", select_js])
-            select_data = json.loads(res_raw)
-            is_select_element = role in ["combobox", "select"]
-            if select_data.get("status") == "selected":
-                selected_text = select_data.get("selected")
-                print(f"⚡ Selected dropdown option: \"{selected_text}\"")
-                actual_filled_val = selected_text
-            elif select_data.get("status") == "unavailable" and is_select_element:
-                avail = select_data.get("available", [])
-                avail_str = ", ".join(avail[:10]) + ("..." if select_data.get("total", 0) > 10 else "")
-                print(f"\n❌ OPTION UNAVAILABLE: Option \"{value}\" is not available for \"{name}\".")
-                print(f"   Available options ({select_data.get('total')}): [{avail_str}]")
-                raise OptionUnavailableError(
-                    f"Option '{value}' is not available in dropdown '{name}'. "
-                    f"Available options are: [{avail_str}]",
-                    available_options=avail,
-                    target=value,
-                    element=name
-                )
-            else:
-                dom_fill_js = rf"""
-                (() => {{
-                    const targetName = {json.dumps(name)};
-                    const targetVal = {json.dumps(value)};
-                    const targetWords = targetName.toLowerCase().split(/[\s\-_]+/).filter(Boolean);
-
-                    let allDocs = [document];
-                    document.querySelectorAll('iframe').forEach(f => {{
-                        try {{
-                            const idoc = f.contentDocument || f.contentWindow.document;
-                            if (idoc) allDocs.push(idoc);
-                        }} catch(e) {{}}
-                    }});
-
-                    let best = null;
-                    let bestScore = -1;
-
-                    allDocs.forEach((doc, docIdx) => {{
-                        const inps = Array.from(doc.querySelectorAll('input:not([type=hidden]):not([type=radio]):not([type=checkbox]), textarea'));
-                        inps.forEach(inp => {{
-                            let sublabel = inp.parentElement ? inp.parentElement.innerText : '';
-                            let lineLabel = inp.closest('.form-line') ? (inp.closest('.form-line').querySelector('label') ? inp.closest('.form-line').querySelector('label').innerText : '') : '';
-                            const ariaLabel = inp.getAttribute('aria-label') || '';
-                            const placeholder = inp.placeholder || '';
-                            const fullText = (lineLabel + ' ' + sublabel + ' ' + (inp.name || '') + ' ' + (inp.id || '') + ' ' + ariaLabel + ' ' + placeholder).toLowerCase();
-
-                            let score = 0;
-                            targetWords.forEach(w => {{
-                                if (['kyc', 'form', 'preview', 'jotform'].includes(w)) return;
-                                if (fullText.includes(w)) score += 3;
-                            }});
-
-                            ['first', 'last', 'city', 'state', 'province', 'postal', 'zip', 'street', 'line 2'].forEach(key => {{
-                                if (targetName.toLowerCase().includes(key) && fullText.includes(key)) score += 8;
-                            }});
-
-                            if (docIdx > 0) score += 2;
-
-                            if (ariaLabel && (targetName.toLowerCase().includes(ariaLabel.toLowerCase()) || ariaLabel.toLowerCase().includes(targetName.toLowerCase()))) score += 10;
-                            if (placeholder && targetName.toLowerCase().includes(placeholder.toLowerCase())) score += 5;
-                            if (!inp.value || inp.value === '') score += 5;
-
-                            if (score > bestScore) {{
-                                bestScore = score;
-                                best = inp;
-                            }}
-                        }});
-                    }});
-
-                    if (best && bestScore > 0) {{
-                        best.scrollIntoView({{block: 'center'}});
-                        best.focus();
-                        best.value = targetVal;
-                        best.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        best.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        return JSON.stringify({{ found: true, id: best.id, name: best.name, value: best.value }});
-                    }}
-                    return JSON.stringify({{ found: false }});
-                }})()
-                """
-                dom_filled = False
-                try:
-                    res_raw = run_cmd([ORCA_BIN, "eval", "--expression", dom_fill_js])
-                    dom_data = json.loads(res_raw)
-                    if dom_data.get("found"):
-                        dom_filled = True
-                        actual_filled_val = dom_data.get("value", value)
-                except Exception:
-                    pass
-
-                print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
-                try:
-                    run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
-                except Exception as e:
-                    if not dom_filled:
-                        raise e
-        except OptionUnavailableError:
-            raise
-        except Exception:
-            print(f"⚡ Executing: orca fill --element {ref} --value \"{value}\"")
-            run_cmd([ORCA_BIN, "fill", "--element", ref, "--value", value])
+    if info.get("disabled"):
+        print(f"\n⚠️  ELEMENT DISABLED: Element [{ref}] \"{name}\" ({role}) is currently disabled on this page.")
+        raise ElementDisabledError(f"Cannot fill '{target}' because element [{ref}] is disabled on the page.", target=target)
 
     before_state = get_page_verification_state()
+
+    key = new_bind_key(ref)
+    try:
+        field = None
+        try:
+            field = bind_element(ref, key=key)
+        except OrcaError as e:
+            print(f"ℹ️  Could not inspect the field in the page ({e}); relying on Orca's fill.")
+
+        if field:
+            tag, field_type = field.get("tag"), field.get("type")
+            if field_type in ("checkbox", "radio"):
+                raise OrcaError(f"Element [{ref}] \"{name}\" is a {field_type}; use --check / --uncheck instead of --fill.")
+            fillable = field.get("contentEditable") or tag in ("textarea", "select") or (
+                tag == "input" and field_type not in ("button", "submit", "reset", "image", "file", "hidden"))
+            if not fillable:
+                raise OrcaError(f"Element [{ref}] \"{name}\" ({tag}) is not a fillable field.")
+
+        if field and field.get("tag") == "select":
+            final_field = _fill_select(ref, name, value, field, key)
+            actual_filled_val = final_field.get("selectedText") or value
+        else:
+            fill_value = value
+            if field:
+                iso_date = parse_date_value(value)
+                formatted = format_date_for_field(iso_date, field, raw_value=value) if iso_date else None
+                if formatted and formatted != value:
+                    print(f"📅 Date field detected; entering \"{value}\" as \"{formatted}\"")
+                    fill_value = formatted
+            final_field = _fill_text(ref, fill_value, field, key)
+            actual_filled_val = final_field.get("value") or fill_value
+
+    finally:
+        release_bound_element(key)
+
     time.sleep(0.3)
     after_state = get_page_verification_state()
     comparison = compare_page_states(before_state, after_state)
+    comparison["filled_value"] = actual_filled_val
+    comparison["field_valid"] = final_field.get("valid")
+    comparison["field_validation_message"] = final_field.get("validationMessage", "")
 
     print("\n" + "=" * 70)
     print(" 🔎 INPUT VERIFICATION REPORT")
     print("=" * 70)
     print(f"✅ Filled element [{ref}] with: \"{actual_filled_val}\"")
-    if comparison.get("all_invalid_inputs"):
-        matching_invalid = [i for i in comparison["all_invalid_inputs"] if i.get("label") == name or i.get("id") == ref]
-        if matching_invalid:
-            print(f"⚠️  Field has validation warning: {matching_invalid[0].get('validationMessage')}")
-        else:
-            print("✅ Field validity: OK")
-    else:
+    if final_field.get("valid") is False:
+        print(f"⚠️  Field has validation warning: {final_field.get('validationMessage') or 'Invalid value'}")
+    elif final_field.get("valid") is True:
         print("✅ Field validity: OK")
+    else:
+        print("ℹ️  Field validity: not checked (field could not be inspected)")
     print("=" * 70)
     return comparison
+
+def _read_checked(ref: str) -> Optional[bool]:
+    try:
+        val = run_orca_json(["is", "--element", ref, "--what", "checked"]).get("checked")
+        return val if isinstance(val, bool) else None
+    except OrcaError:
+        return None
+
+def _state_label(state: Optional[bool]) -> str:
+    if state is True:
+        return "Checked (true)"
+    if state is False:
+        return "Unchecked (false)"
+    return "Unknown"
 
 def act_checkbox_radio(target: str, action: str = "check") -> Dict[str, Any]:
     """
     Toggles or sets the checked state of a checkbox, radio button, or switch.
     action can be: 'check', 'uncheck', or 'toggle'.
-    Works robustly across top-level pages, iframes, and shadow DOM.
+    Acts on the exact element behind the resolved ref (works inside iframes) and
+    verifies the resulting state on that same element.
     """
     action = action.lower()
     if action not in ["check", "uncheck", "toggle"]:
         raise ValueError(f"Invalid action: '{action}'. Choose from 'check', 'uncheck', or 'toggle'.")
 
     print(f"\n🎯 Finding target element for {action}: '{target}'...")
-    ref, info = resolve_target_element(target)
+    ref, info = resolve_target_element(target, require="is_checkable")
     name = info.get("name") or info.get("role")
     role = info.get("role", "")
     print(f"👉 Matched element: [{ref}] \"{name}\" ({role})")
 
-    initial_checked = info.get("checked")
+    if info.get("disabled"):
+        print(f"\n⚠️  ELEMENT DISABLED: Element [{ref}] \"{name}\" ({role}) is currently disabled on this page.")
+        raise ElementDisabledError(f"Cannot {action} '{target}' because element [{ref}] is disabled on the page.", target=target)
 
-    # If initial state is already the desired state (and action is not toggle), no-op
-    if initial_checked is not None:
-        if action == "check" and initial_checked is True:
-            print("\n" + "=" * 70)
-            print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
-            print("=" * 70)
-            print(f"Target Element : [{ref}] \"{name}\" ({role})")
-            print(f"Action Taken   : {action.upper()}")
-            print(f"Initial State  : Checked (true)")
-            print(f"Final State    : Checked (true)")
-            print(f"Status         : ℹ️ ALREADY CHECKED (No change needed)")
-            print("=" * 70)
-            return {"success": True, "changed": False, "initialState": True, "finalState": True}
-        elif action == "uncheck" and initial_checked is False:
-            print("\n" + "=" * 70)
-            print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
-            print("=" * 70)
-            print(f"Target Element : [{ref}] \"{name}\" ({role})")
-            print(f"Action Taken   : {action.upper()}")
-            print(f"Initial State  : Unchecked (false)")
-            print(f"Final State    : Unchecked (false)")
-            print(f"Status         : ℹ️ ALREADY UNCHECKED (No change needed)")
-            print("=" * 70)
-            return {"success": True, "changed": False, "initialState": False, "finalState": False}
+    initial_checked = _read_checked(ref)
+    if initial_checked is None:
+        initial_checked = info.get("checked")
 
-    toggle_js = rf"""
-    (() => {{
-        const target = {json.dumps(name)};
-        const action = {json.dumps(action)};
-        const targetWords = target.toLowerCase().split(/[\s\-_]+/).filter(Boolean);
-
-        let allDocs = [document];
-        document.querySelectorAll('iframe').forEach(f => {{
-            try {{
-                const idoc = f.contentDocument || f.contentWindow.document;
-                if (idoc) allDocs.push(idoc);
-            }} catch(e) {{}}
-        }});
-
-        let best = null;
-        let bestScore = -1;
-
-        allDocs.forEach((doc, docIdx) => {{
-            const inputs = Array.from(doc.querySelectorAll('input[type=checkbox], input[type=radio]'));
-            inputs.forEach(inp => {{
-                let lbl = '';
-                if (inp.labels && inp.labels[0]) lbl = inp.labels[0].innerText;
-                else if (inp.parentElement) lbl = inp.parentElement.innerText;
-                const formLine = inp.closest('.form-line');
-                const lineText = formLine ? (formLine.innerText || '') : '';
-                const ariaLabel = inp.getAttribute('aria-label') || '';
-                const full = (lbl + ' ' + (inp.name || '') + ' ' + (inp.id || '') + ' ' + (inp.value || '') + ' ' + ariaLabel + ' ' + lineText).toLowerCase();
-                const labelText = (lbl + ' ' + (inp.value || '')).toLowerCase();
-
-                let score = 0;
-                targetWords.forEach(w => {{
-                    if (['kyc', 'form', 'preview', 'jotform', 'to', 'be', 'by', 'for', 'of', 'the', 'in', 'and', 'a', 'an'].includes(w)) return;
-                    if (labelText.includes(w)) score += 10;
-                    else if (full.includes(w)) score += 3;
-                }});
-                ['male', 'female', 'single', 'married', 'resident', 'uid', 'passport', 'voter', 'driving', 'telephone', 'electricity', 'gas', 'lease', 'bank', 'ration'].forEach(key => {{
-                    if (target.toLowerCase().includes(key) && labelText.includes(key)) score += 10;
-                    else if (target.toLowerCase().includes(key) && full.includes(key)) score += 4;
-                }});
-                if (docIdx > 0) score += 2;
-
-                if (score > bestScore) {{
-                    bestScore = score;
-                    best = inp;
-                }}
-            }});
-        }});
-
-        if (best && bestScore > 0) {{
-            best.scrollIntoView({{block: 'center'}});
-            const init = best.checked;
-            let desiredState = init;
-            if (action === 'check') desiredState = true;
-            else if (action === 'uncheck') desiredState = false;
-            else if (action === 'toggle') desiredState = !init;
-
-            if (best.checked !== desiredState) {{
-                if (best.labels && best.labels[0]) {{
-                    best.labels[0].click();
-                }} else {{
-                    best.click();
-                }}
-            }}
-            best.checked = desiredState;
-            best.dispatchEvent(new Event('input', {{bubbles: true}}));
-            best.dispatchEvent(new Event('change', {{bubbles: true}}));
-            return JSON.stringify({{ found: true, id: best.id, name: best.name, checked: best.checked }});
-        }}
-        return JSON.stringify({{ found: false }});
-    }})()
-    """
-    js_toggled = False
-    try:
-        raw_res = run_cmd([ORCA_BIN, "eval", "--expression", toggle_js])
-        t_data = json.loads(raw_res)
-        if t_data.get("found"):
-            js_toggled = True
-            final_checked = t_data.get("checked")
-    except Exception:
-        pass
-
-    # Execute click via Orca CLI only if not already toggled via DOM injection
-    if not js_toggled:
-        print(f"⚡ Executing: orca click --element {ref}")
-        try:
-            run_cmd([ORCA_BIN, "click", "--element", ref])
-        except Exception as e:
-            raise e
-        time.sleep(0.3)
-
-    # Re-inspect post-click state
-    new_snapshot = get_orca_snapshot()
-    new_pruned = smart_dom_prune(new_snapshot)
-    matching_new = [el for el in new_pruned if el["ref"] == ref]
-    snap_checked = matching_new[0].get("checked") if matching_new else None
-    if not js_toggled and snap_checked is not None:
-        final_checked = snap_checked
-    elif final_checked is None:
-        if action == "check":
-            final_checked = True
-        elif action == "uncheck":
-            final_checked = False
-        elif initial_checked is not None:
-            final_checked = not initial_checked
-
-    changed = (initial_checked != final_checked) if initial_checked is not None else True
-
-    print("\n" + "=" * 70)
-    print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
-    print("=" * 70)
-    print(f"Target Element : [{ref}] \"{name}\" ({role})")
-    print(f"Action Taken   : {action.upper()}")
-    init_str = "Checked (true)" if initial_checked is True else "Unchecked (false)" if initial_checked is False else "Unknown"
-    final_str = "Checked (true)" if final_checked is True else "Unchecked (false)" if final_checked is False else "Toggled"
-    print(f"Initial State  : {init_str}")
-    print(f"Final State    : {final_str}")
-    if changed:
-        print(f"Status         : ✅ SUCCESSFULLY {action.upper()}ED")
+    if action == "check":
+        desired = True
+    elif action == "uncheck":
+        desired = False
     else:
-        print(f"Status         : ℹ️ ALREADY {action.upper()}ED (No change needed)")
-    print("=" * 70)
+        desired = (not initial_checked) if initial_checked is not None else None
+
+    def report(final_checked: Optional[bool], changed: bool):
+        print("\n" + "=" * 70)
+        print(" ☑️  CHECKBOX / RADIO ACTION REPORT")
+        print("=" * 70)
+        print(f"Target Element : [{ref}] \"{name}\" ({role})")
+        print(f"Action Taken   : {action.upper()}")
+        print(f"Initial State  : {_state_label(initial_checked)}")
+        print(f"Final State    : {_state_label(final_checked)}")
+        if not changed:
+            print(f"Status         : ℹ️ ALREADY {action.upper()}ED (No change needed)")
+        elif final_checked is None:
+            print(f"Status         : ⚠️ {action.upper()} SENT (final state could not be read back)")
+        else:
+            print(f"Status         : ✅ SUCCESSFULLY {action.upper()}ED")
+        print("=" * 70)
+
+    if desired is not None and initial_checked == desired:
+        report(initial_checked, changed=False)
+        return {"success": True, "changed": False, "initialState": initial_checked, "finalState": initial_checked}
+
+    if role == "radio" and desired is False:
+        raise OrcaError(
+            f"Radio button [{ref}] \"{name}\" cannot be unchecked directly; "
+            f"select another option in its group instead."
+        )
+
+    clicked = False
+    if desired is None:
+        print(f"⚡ Executing: orca click --element {ref}")
+        run_cmd([ORCA_BIN, "click", "--element", ref])
+        clicked = True
+    else:
+        cmd = "check" if desired else "uncheck"
+        print(f"⚡ Executing: orca {cmd} --element {ref}")
+        try:
+            run_orca_json([cmd, "--element", ref])
+        except OrcaError as e:
+            print(f"   ↪ orca {cmd} failed ({e}); clicking the element instead")
+            run_cmd([ORCA_BIN, "click", "--element", ref])
+            clicked = True
+    time.sleep(0.3)
+
+    final_checked = _read_checked(ref)
+    if desired is not None and final_checked is not None and final_checked != desired and not clicked:
+        print("   ↪ State did not change; clicking the element instead")
+        run_cmd([ORCA_BIN, "click", "--element", ref])
+        time.sleep(0.3)
+        final_checked = _read_checked(ref)
+    if desired is not None and final_checked is not None and final_checked != desired:
+        raise OrcaError(
+            f"Could not {action} [{ref}] \"{name}\": it is still "
+            f"{'checked' if final_checked else 'unchecked'}."
+        )
+
+    changed = (initial_checked != final_checked) if (initial_checked is not None and final_checked is not None) else True
+    report(final_checked, changed)
 
     return {
         "success": True,
@@ -1482,27 +1554,12 @@ def act_keypress(key: str, target: Optional[str] = None) -> Dict[str, Any]:
             print(f"\n⚠️  ELEMENT DISABLED: Element [{ref}] \"{name}\" ({role}) is currently disabled on this page.")
             raise ElementDisabledError(f"Cannot press key '{key}' on '{target}' because element [{ref}] is disabled.", target=target)
 
-        # Focus target element via JavaScript
-        focus_js = f"""
-        (() => {{
-            const target = {json.dumps(name)};
-            const candidates = Array.from(document.querySelectorAll('button, input, a, select, textarea, [role=button], [role=combobox], [tabindex]'));
-            const match = candidates.find(el => {{
-                const txt = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().toLowerCase();
-                return txt === target.toLowerCase() || txt.includes(target.toLowerCase());
-            }});
-            if (match) {{
-                match.scrollIntoView({{block: 'center', inline: 'center'}});
-                match.focus();
-                return true;
-            }}
-            return false;
-        }})()
-        """
+        # Focus the exact element so the key goes to it, not to whatever had focus before
         try:
-            run_cmd([ORCA_BIN, "eval", "--expression", focus_js])
+            run_cmd([ORCA_BIN, "scrollintoview", "--element", ref])
         except Exception:
             pass
+        run_cmd([ORCA_BIN, "focus", "--element", ref])
 
     pre_state = get_page_verification_state()
 
@@ -1522,9 +1579,11 @@ def act_keypress(key: str, target: Optional[str] = None) -> Dict[str, Any]:
     else:
         print(f"Target Element : (Active Browser Focus)")
     print(f"Status         : ✅ KEYPRESS DISPATCHED")
-    print(f"Action Outcome : {comparison.get('change_type')}")
-    if comparison.get("details"):
-        print(f"Details        : {comparison.get('details')}")
+    print(f"Action Outcome : {comparison.get('verdict')}")
+    if comparison.get("url_changed"):
+        print(f"Navigated To   : {comparison.get('to_url')}")
+    if comparison.get("new_error_alerts"):
+        print(f"Error Alerts   : {'; '.join(comparison['new_error_alerts'])}")
     print("=" * 70)
 
     return {

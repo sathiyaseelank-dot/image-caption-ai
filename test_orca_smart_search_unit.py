@@ -14,6 +14,7 @@ Tests core logic using mocked Orca CLI responses:
 import unittest
 from unittest.mock import patch, MagicMock
 import json
+import re
 import subprocess
 import os
 
@@ -376,6 +377,258 @@ class TestJsonCliMode(unittest.TestCase):
             self.assertEqual(parsed["error_type"], "ElementNotFoundError")
             self.assertEqual(parsed["exit_code"], 3)
             self.assertEqual(parsed["target"], "missing_btn")
+
+
+class FakeOrca:
+    """Minimal stand-in for the Orca CLI that tracks per-ref element state and focus."""
+    def __init__(self, fields):
+        self.fields = fields
+        self.focused = None
+        self.stored = {}
+        self.calls = []
+
+    def __call__(self, args, timeout=15.0):
+        cmd = args[1]
+        self.calls.append(cmd)
+        flag = lambda name: args[args.index(name) + 1]
+        if cmd == "eval":
+            expr = flag("--expression")
+            if "const OP =" in expr:
+                op = json.loads(re.search(r'const OP = (".*?");', expr).group(1))
+                value = json.loads(re.search(r'const VALUE = (.*?);\n', expr).group(1))
+                mode = json.loads(re.search(r'const MODE = (".*?");', expr).group(1))
+                key = json.loads(re.search(r'const KEY = (".*?");', expr).group(1))
+                if mode == "stored":
+                    if key not in self.stored:
+                        return json.dumps({"error": "no-stored-element"})
+                    field = self.fields[self.stored[key]]
+                elif self.focused is None:
+                    return json.dumps({"error": "element did not receive focus"})
+                else:
+                    field = self.fields[self.focused]
+                    if key:
+                        self.stored[key] = self.focused
+                if op == "set_value":
+                    field["value"] = field.get("_mask", lambda v: v)(value) if "_mask" in field else value
+                elif op == "type_text":
+                    field["value"] = value
+                    if field["tag"] == "select":
+                        field["selectedText"] = next((o["text"] for o in field["options"] if o["value"] == value), "")
+                return json.dumps({k: v for k, v in field.items() if not k.startswith("_")})
+            if "deepest.blur()" in expr:
+                self.focused = None
+            return "true"
+        ref = flag("--element") if "--element" in args else None
+        field = self.fields.get(ref, {})
+        if cmd == "focus":
+            if field.get("_focusable", True):
+                self.focused = ref
+            return json.dumps({"ok": True, "result": {"focused": ref}})
+        if cmd == "fill":
+            if field.get("_fill_sticks", True):
+                field["value"] = flag("--value")
+            if field.get("_stale_after_fill"):
+                field["_focusable"] = False
+            return ""
+        if cmd == "get":
+            return json.dumps({"ok": True, "result": {"value": field.get("value", "")}})
+        if cmd == "select":
+            wanted = flag("--value")
+            if field.get("_select_sticks", True):
+                for o in field["options"]:
+                    if wanted in (o["text"], o["value"]):
+                        field["value"], field["selectedText"] = o["value"], o["text"]
+            return json.dumps({"ok": True, "result": {"selected": [wanted]}})
+        if cmd == "is":
+            if "_checked" not in field:
+                raise oss.OrcaError("is not supported")
+            return json.dumps({"ok": True, "result": {"checked": field["_checked"]}})
+        if cmd in ("check", "uncheck"):
+            if field.get("_check_sticks", True):
+                field["_checked"] = (cmd == "check")
+            return json.dumps({"ok": True, "result": {cmd: ref}})
+        if cmd == "click":
+            if "_checked" in field:
+                field["_checked"] = not field["_checked"]
+            return ""
+        return ""
+
+def text_field(value="", **extra):
+    field = {"tag": "input", "type": "text", "id": "", "name": "", "placeholder": "", "contentEditable": False,
+             "value": value, "valid": True, "validationMessage": ""}
+    field.update(extra)
+    return field
+
+CLEAN_STATE = {"url": "https://example.com", "title": "t", "bodyText": "", "invalidInputs": [], "alerts": [], "dialogs": [], "formValues": {}}
+
+@patch("orca_smart_search.time.sleep")
+@patch("orca_smart_search.get_page_verification_state", return_value=CLEAN_STATE)
+class TestRefBoundActions(unittest.TestCase):
+    def snapshot(self, refs, text=""):
+        return {"result": {"refs": refs, "snapshot": text}}
+
+    def test_fill_textbox_never_touches_other_selects(self, _state, _sleep):
+        fake = FakeOrca({"e1": text_field()})
+        snap = self.snapshot({"e1": {"name": "City", "role": "textbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            res = oss.act_fill_and_verify("City", "India")
+        self.assertEqual(fake.fields["e1"]["value"], "India")
+        self.assertIn("fill", fake.calls)
+        self.assertNotIn("select", fake.calls)
+        self.assertEqual(res["filled_value"], "India")
+
+    def test_fill_falls_back_to_exact_element_when_orca_fill_does_not_stick(self, _state, _sleep):
+        fake = FakeOrca({"e1": text_field(_fill_sticks=False)})
+        snap = self.snapshot({"e1": {"name": "First Name", "role": "textbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            oss.act_fill_and_verify("First Name", "Asha")
+        self.assertEqual(fake.fields["e1"]["value"], "Asha")
+
+    def test_fill_verifies_same_element_when_ref_goes_stale(self, _state, _sleep):
+        fake = FakeOrca({"e1": text_field(type="date", _stale_after_fill=True)})
+        snap = self.snapshot({"e1": {"name": "Start Date", "role": "textbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            res = oss.act_fill_and_verify("Start Date", "May 15, 2026")
+        self.assertEqual(fake.fields["e1"]["value"], "2026-05-15")
+        self.assertEqual(res["filled_value"], "2026-05-15")
+
+    def test_fill_types_into_masked_input_when_setter_is_rewritten(self, _state, _sleep):
+        fake = FakeOrca({"e1": text_field(placeholder="MM-DD-YYYY", _fill_sticks=False, _mask=lambda v: "M1-DD-YYY0")})
+        snap = self.snapshot({"e1": {"name": "Date of Birth", "role": "textbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            oss.act_fill_and_verify("Date of Birth", "01-15-1990")
+        self.assertEqual(fake.fields["e1"]["value"], "01-15-1990")
+
+    def test_fill_raises_when_focus_fails_and_value_does_not_stick(self, _state, _sleep):
+        fake = FakeOrca({"e1": text_field(_fill_sticks=False, _focusable=False)})
+        snap = self.snapshot({"e1": {"name": "First Name", "role": "textbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            with self.assertRaises(oss.OrcaError):
+                oss.act_fill_and_verify("First Name", "Asha")
+
+    def test_fill_disabled_field_raises(self, _state, _sleep):
+        snap = self.snapshot({"e1": {"name": "City", "role": "textbox"}}, '- textbox "City" [disabled, ref=e1]')
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap):
+            with self.assertRaises(oss.ElementDisabledError):
+                oss.act_fill_and_verify("City", "Pune")
+
+    def test_select_validates_option_against_element(self, _state, _sleep):
+        options = [{"text": "Please Select", "value": ""}, {"text": "India", "value": "IN"}]
+        fake = FakeOrca({"e1": text_field(tag="select", type="select-one", options=options, selectedText="Please Select")})
+        snap = self.snapshot({"e1": {"name": "Country", "role": "combobox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            with self.assertRaises(oss.OptionUnavailableError) as ctx:
+                oss.act_fill_and_verify("Country", "Narnia")
+            self.assertIn("India", ctx.exception.available_options)
+            res = oss.act_fill_and_verify("Country", "india")
+        self.assertEqual(fake.fields["e1"]["value"], "IN")
+        self.assertEqual(res["filled_value"], "India")
+
+    def test_date_is_formatted_for_placeholder(self, _state, _sleep):
+        fake = FakeOrca({"e1": text_field(placeholder="MM-DD-YYYY")})
+        snap = self.snapshot({"e1": {"name": "Date of Birth", "role": "textbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            oss.act_fill_and_verify("Date of Birth", "May 15, 1990")
+        self.assertEqual(fake.fields["e1"]["value"], "05-15-1990")
+
+    def test_non_date_field_keeps_date_like_text(self, _state, _sleep):
+        fake = FakeOrca({"e1": text_field()})
+        snap = self.snapshot({"e1": {"name": "Candidate Address", "role": "textbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            oss.act_fill_and_verify("Candidate Address", "12 May Street 2021")
+        self.assertEqual(fake.fields["e1"]["value"], "12 May Street 2021")
+
+    def test_checkbox_does_not_crash_when_state_unreadable(self, _state, _sleep):
+        fake = FakeOrca({"e1": {"_check_sticks": False}})
+        snap = self.snapshot({"e1": {"name": "Agree to terms", "role": "checkbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            res = oss.act_checkbox_radio("Agree to terms", "check")
+        self.assertTrue(res["success"])
+        self.assertIsNone(res["finalState"])
+
+    def test_checkbox_check_verifies_state(self, _state, _sleep):
+        fake = FakeOrca({"e1": {"_checked": False}})
+        snap = self.snapshot({"e1": {"name": "Agree to terms", "role": "checkbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            res = oss.act_checkbox_radio("Agree to terms", "check")
+            self.assertEqual((res["initialState"], res["finalState"], res["changed"]), (False, True, True))
+            res = oss.act_checkbox_radio("Agree to terms", "check")
+            self.assertFalse(res["changed"])
+            res = oss.act_checkbox_radio("Agree to terms", "toggle")
+        self.assertFalse(fake.fields["e1"]["_checked"])
+
+    def test_checkbox_falls_back_to_click_and_reports_failure(self, _state, _sleep):
+        fake = FakeOrca({"e1": {"_checked": False, "_check_sticks": False}})
+        snap = self.snapshot({"e1": {"name": "Agree", "role": "checkbox"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            res = oss.act_checkbox_radio("Agree", "check")
+        self.assertTrue(res["finalState"])
+        self.assertIn("click", fake.calls)
+
+    def test_radio_cannot_be_unchecked(self, _state, _sleep):
+        fake = FakeOrca({"e1": {"_checked": True}})
+        snap = self.snapshot({"e1": {"name": "Male", "role": "radio"}})
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap), patch("orca_smart_search.run_cmd", side_effect=fake):
+            with self.assertRaises(oss.OrcaError):
+                oss.act_checkbox_radio("Male", "uncheck")
+
+    def test_keypress_reports_verdict(self, _state, _sleep):
+        fake = FakeOrca({})
+        with patch("orca_smart_search.run_cmd", side_effect=fake):
+            res = oss.act_keypress("Enter")
+        self.assertEqual(res["comparison"]["verdict"], "NO_VISIBLE_CHANGE")
+
+class TestSnapshotParsingRegressions(unittest.TestCase):
+    def test_disabled_and_checked_come_from_ref_bracket_only(self):
+        text = '\n'.join([
+            '- button "Show disabled accounts" [ref=e1]',
+            '- button "Next" [disabled, ref=e2]',
+            '- checkbox "checked=true by default" [checked=false, ref=e3]',
+            '- radio "Male" [checked=true, ref=e4]',
+            '- combobox "Country" [expanded=false, ref=e5]: India',
+        ])
+        _, values, disabled, checked = oss.extract_snapshot_metadata(text)
+        self.assertEqual(disabled, {"e2": True})
+        self.assertEqual(checked, {"e3": False, "e4": True})
+        self.assertEqual(values["e5"], "India")
+
+    def test_direct_ref_keeps_disabled_state(self):
+        snap = {"result": {"refs": {"e2": {"name": "Next", "role": "button"}}, "snapshot": '- button "Next" [disabled, ref=e2]'}}
+        with patch("orca_smart_search.get_orca_snapshot", return_value=snap):
+            ref, el = oss.resolve_target_element("e2")
+        self.assertTrue(el["disabled"])
+
+    def test_label_enrichment_aligns_by_document_order(self):
+        snap = {"result": {
+            "refs": {"e1": {"name": "Email", "role": "textbox"}, "e7": {"name": "", "role": "textbox"}, "e3": {"name": "", "role": "textbox"}},
+            "snapshot": '- textbox "Email" [ref=e1]\n- textbox [ref=e7]\n- textbox [ref=e3]'}}
+        labels = [{"index": 0, "resolvedLabel": "Phone"}, {"index": 1, "resolvedLabel": "Fax"}]
+        with patch("orca_smart_search.run_cmd", side_effect=[json.dumps(snap), json.dumps(labels)]):
+            refs = oss.get_orca_snapshot()["result"]["refs"]
+        self.assertEqual((refs["e1"]["name"], refs["e7"]["name"], refs["e3"]["name"]), ("Email", "Phone", "Fax"))
+
+    def test_label_enrichment_skipped_when_lists_do_not_line_up(self):
+        snap = {"result": {"refs": {"e2": {"name": "", "role": "textbox"}}, "snapshot": '- textbox [ref=e2]'}}
+        labels = [{"index": 0, "resolvedLabel": "Email"}, {"index": 1, "resolvedLabel": "Phone"}]
+        with patch("orca_smart_search.run_cmd", side_effect=[json.dumps(snap), json.dumps(labels)]):
+            refs = oss.get_orca_snapshot()["result"]["refs"]
+        self.assertEqual(refs["e2"]["name"], "")
+
+    def test_format_date_for_field(self):
+        self.assertEqual(oss.format_date_for_field("1990-05-15", {"type": "date"}), "1990-05-15")
+        self.assertEqual(oss.format_date_for_field("1990-05-15", {"type": "text", "placeholder": "DD/MM/YYYY"}), "15/05/1990")
+        self.assertEqual(oss.format_date_for_field("2020-04-03", {"type": "text", "placeholder": "MM-DD-YYYY"}, raw_value="03-04-2020"), "03-04-2020")
+        self.assertIsNone(oss.format_date_for_field("1990-05-15", {"type": "text", "placeholder": "Your name"}))
+
+    def test_format_date_reads_field_order_regardless_of_separator(self):
+        mmdd = {"type": "text", "placeholder": "MM-DD-YYYY"}
+        for raw in ("03-04-2020", "03/04/2020", "3.4.2020"):
+            iso = oss.parse_date_value(raw)
+            self.assertEqual(oss.format_date_for_field(iso, mmdd, raw_value=raw), "03-04-2020", raw)
+        ddmm = {"type": "text", "placeholder": "DD/MM/YYYY"}
+        self.assertEqual(oss.format_date_for_field(oss.parse_date_value("15-05-1990"), ddmm, raw_value="15-05-1990"), "15/05/1990")
+        # not valid in the field's order -> falls back to the parsed date
+        self.assertEqual(oss.format_date_for_field("1990-05-15", mmdd, raw_value="15/05/1990"), "05-15-1990")
 
 if __name__ == "__main__":
     unittest.main()
