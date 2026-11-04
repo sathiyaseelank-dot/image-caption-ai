@@ -403,6 +403,419 @@ def send_prompt(prompt_text: str, auto_approve: bool = True, page_id: Optional[s
     }
 
 
+def navigate_sidebar_tab(tab_name: str, page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Navigates to a specific sidebar section (e.g. Characters, All media, Images, Videos, Scenes, Uploads)."""
+    page_id = page_id or find_google_flow_page()
+    js_code = f"""(() => {{
+        const target = {json.dumps(tab_name)}.toLowerCase().trim();
+        const drawer = document.querySelector(".mat-drawer-inner-container");
+        if (!drawer) return {{ ok: false, error: "Sidebar drawer not found" }};
+        
+        const items = Array.from(drawer.querySelectorAll("button, a, [role='button'], mat-list-item"));
+        const match = items.find(el => (el.innerText || "").toLowerCase().includes(target));
+        if (!match) {{
+            const available = items.map(i => (i.innerText || "").replace(/\\n+/g, " ").trim()).filter(Boolean);
+            return {{ ok: false, error: "Tab not found: " + target, available }};
+        }}
+        
+        match.click();
+        return {{
+            ok: true,
+            tab: target,
+            activeText: (match.innerText || "").replace(/\\n+/g, " ").trim(),
+            url: window.location.href
+        }};
+    }})()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def get_characters_info(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Navigates to Characters tab and retrieves all existing characters and action tiles."""
+    page_id = page_id or find_google_flow_page()
+    nav_res = navigate_sidebar_tab("Characters", page_id=page_id)
+    if not nav_res.get("ok"):
+        return nav_res
+
+    time.sleep(0.5)
+
+    js_code = """(() => {
+        const tiles = Array.from(document.querySelectorAll(".character-tile-container, [class*='character-tile']"));
+        const characters = [];
+        const seen = new Set();
+        for (const t of tiles) {
+            const nameEl = t.querySelector(".character-tile-name, [class*='name']");
+            const imgEl = t.querySelector("img");
+            const name = nameEl ? nameEl.innerText.trim() : t.innerText.trim();
+            if (name && !seen.has(name)) {
+                seen.add(name);
+                characters.push({
+                    name: name,
+                    thumbnail: imgEl ? (imgEl.src || null) : null
+                });
+            }
+        }
+        
+        const actionTiles = Array.from(document.querySelectorAll("button.custom-tile-container, .custom-tile-container")).map(b => (b.innerText || "").replace(/\\n+/g, " ").trim());
+
+        return {
+            ok: true,
+            url: window.location.href,
+            charactersCount: characters.length,
+            characters: characters,
+            actionTiles: actionTiles
+        };
+    })()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    try:
+        data = json.loads(raw)
+        data["nav"] = nav_res
+        return data
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def open_character_creator(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Navigates to the Character creation screen (/project/<id>/character)."""
+    page_id = page_id or find_google_flow_page()
+    get_characters_info(page_id=page_id)
+    time.sleep(0.5)
+
+    js_code = """(() => {
+        const btn = Array.from(document.querySelectorAll("button.custom-tile-container, [class*='custom-tile']")).find(b => (b.innerText || "").includes("New character"));
+        if (!btn) return { ok: false, error: "New character button not found" };
+        btn.click();
+        return { ok: true, clicked: true };
+    })()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    time.sleep(1.0)
+
+    # Check state on character page
+    check_js = """(() => {
+        const archetypes = Array.from(document.querySelectorAll("button")).map(b => (b.innerText || "").replace(/\\n+/g, " ").trim()).filter(t => t.startsWith("The "));
+        const promptInput = document.querySelector("[contenteditable='true'], textarea");
+        return {
+            ok: true,
+            url: window.location.href,
+            archetypes: archetypes,
+            hasPromptInput: !!promptInput,
+            promptPlaceholder: promptInput ? (promptInput.getAttribute("placeholder") || "Describe your character…") : null
+        };
+    })()"""
+    state_raw = run_orca_eval(check_js, page_id=page_id)
+    try:
+        return json.loads(state_raw)
+    except Exception:
+        return {"ok": True, "raw": state_raw}
+
+
+def navigate_back_from_creator(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Clicks the back button (arrow_back) to return from character creator to project view."""
+    page_id = page_id or find_google_flow_page()
+    js_code = """(() => {
+        const backBtn = Array.from(document.querySelectorAll("button")).find(b => (b.innerText || "").includes("arrow_back"));
+        if (!backBtn) return { ok: false, error: "Back button not found" };
+        backBtn.click();
+        return { ok: true, clicked: true };
+    })()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    time.sleep(1.2)
+    url_check = run_orca_eval("window.location.href", page_id=page_id)
+    return {"ok": True, "url": url_check.strip()}
+
+
+def list_sidebar_tabs(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Lists all available sidebar tabs and reports the currently activated section."""
+    page_id = page_id or find_google_flow_page()
+    js_code = """(() => {
+        const drawer = document.querySelector(".mat-drawer-inner-container");
+        if (!drawer) return { ok: false, error: "Sidebar drawer not found" };
+        const items = Array.from(drawer.querySelectorAll("button, a, [role='button'], mat-list-item"));
+        const tabs = [];
+        let activeTab = null;
+        for (const el of items) {
+            const rawText = (el.innerText || "").replace(/\\n+/g, " ").trim();
+            if (!rawText) continue;
+            const isActive = el.classList.contains("mdc-list-item--activated") || el.getAttribute("aria-current") === "true";
+            const tabInfo = {
+                title: rawText,
+                tag: el.tagName,
+                active: isActive
+            };
+            tabs.push(tabInfo);
+            if (isActive) activeTab = rawText;
+        }
+        return {
+            ok: true,
+            activeTab: activeTab,
+            totalTabs: tabs.length,
+            tabs: tabs
+        };
+    })()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def toggle_sidebar_drawer(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Toggles (collapses/expands) the left sidebar drawer."""
+    page_id = page_id or find_google_flow_page()
+    js_code = """(() => {
+        const collapseBtn = Array.from(document.querySelectorAll(".mat-drawer-inner-container button, .mat-drawer-inner-container a, button")).find(b => {
+            const t = (b.innerText || "").toLowerCase();
+            const l = (b.getAttribute("aria-label") || "").toLowerCase();
+            return t.includes("collapse") || l.includes("collapse") || t.includes("expand") || l.includes("expand") || t.includes("left_panel_close") || t.includes("left_panel_open");
+        });
+        if (!collapseBtn) return { ok: false, error: "Collapse/expand button not found" };
+        collapseBtn.click();
+        return { ok: true, clicked: (collapseBtn.innerText || collapseBtn.getAttribute("aria-label") || "toggled").replace(/\\n+/g, " ").trim() };
+    })()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    time.sleep(0.5)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def get_gallery_items(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Retrieves all media, character, and scene tiles currently displayed in the gallery view."""
+    page_id = page_id or find_google_flow_page()
+    js_code = """(() => {
+        const tileContainers = Array.from(document.querySelectorAll("flow-grid-tile-container"));
+        const items = tileContainers.map((tc, idx) => {
+            const label = tc.getAttribute("aria-label") || ("Item " + (idx + 1));
+            const isVideo = !!tc.querySelector("flow-video-tile, [class*='video'], mat-icon[data-mat-icon-name='play_circle']") || tc.innerText.includes("play_circle");
+            const isCharacter = !!tc.querySelector(".character-tile-container, [class*='character']") || tc.innerText.includes("accessibility_new");
+            const favBtn = tc.querySelector("button[aria-label='Favorite']");
+            const reuseBtn = tc.querySelector("button[aria-label='Reuse prompt']");
+            const moreBtn = tc.querySelector("button[aria-label='More options']");
+            const img = tc.querySelector("img");
+            const video = tc.querySelector("video");
+
+            return {
+                index: idx + 1,
+                label: label,
+                type: isCharacter ? "character" : (isVideo ? "video" : "image"),
+                hasFavorite: !!favBtn,
+                hasReusePrompt: !!reuseBtn,
+                hasMoreOptions: !!moreBtn,
+                thumbnail: img ? img.src : (video ? video.src : null)
+            };
+        });
+        return {
+            ok: true,
+            count: items.length,
+            items: items
+        };
+    })()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def trigger_tile_action(target: Any, action: str, page_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Executes an action on a gallery tile.
+    target: 1-based index (int) or case-insensitive string matching the card label.
+    action: 'favorite', 'reuse prompt', 'animate', 'add to prompt', 'download', 'copy', 'rename', 'set project cover', 'trash', or 'preview'.
+    """
+    page_id = page_id or find_google_flow_page()
+    act = action.lower().strip()
+    js_code = f"""(() => {{
+        const targetVal = {json.dumps(target)};
+        const actionName = {json.dumps(act)};
+        const tiles = Array.from(document.querySelectorAll("flow-grid-tile-container"));
+        if (!tiles.length) return {{ ok: false, error: "No gallery tiles found" }};
+
+        let targetTile = null;
+        if (typeof targetVal === "number") {{
+            const idx = targetVal - 1;
+            if (idx >= 0 && idx < tiles.length) targetTile = tiles[idx];
+        }} else {{
+            const query = String(targetVal).toLowerCase();
+            targetTile = tiles.find(t => (t.getAttribute("aria-label") || "").toLowerCase().includes(query));
+        }}
+
+        if (!targetTile) return {{ ok: false, error: "Tile not found matching target: " + targetVal }};
+        const label = targetTile.getAttribute("aria-label") || "unnamed";
+
+        if (actionName === "favorite") {{
+            const favBtn = targetTile.querySelector("button[aria-label='Favorite']");
+            if (!favBtn) return {{ ok: false, error: "Favorite button not available on this tile" }};
+            favBtn.click();
+            return {{ ok: true, action: "favorite", tile: label }};
+        }}
+
+        if (actionName === "reuse prompt" || actionName === "reuse") {{
+            const reuseBtn = targetTile.querySelector("button[aria-label='Reuse prompt']");
+            if (!reuseBtn) return {{ ok: false, error: "Reuse prompt button not available on this tile" }};
+            reuseBtn.click();
+            return {{ ok: true, action: "reuse_prompt", tile: label }};
+        }}
+
+        if (actionName === "preview" || actionName === "click" || actionName === "open") {{
+            const mainBtn = targetTile.querySelector("button[aria-label]:not([aria-label='Favorite']):not([aria-label='Reuse prompt']):not([aria-label='More options'])");
+            if (mainBtn) mainBtn.click();
+            else targetTile.click();
+            return {{ ok: true, action: "preview", tile: label }};
+        }}
+
+        // Otherwise open More options menu and click menu item
+        const moreBtn = targetTile.querySelector("button[aria-label='More options']");
+        if (!moreBtn) return {{ ok: false, error: "More options button not available on this tile" }};
+        moreBtn.click();
+
+        // Let menu open synchronously in DOM
+        const menu = document.querySelector(".mat-mdc-menu-panel, [role='menu']");
+        if (!menu) return {{ ok: false, error: "Menu panel failed to open" }};
+
+        const menuItems = Array.from(menu.querySelectorAll("button, [role='menuitem']"));
+        const match = menuItems.find(m => (m.innerText || "").toLowerCase().includes(actionName));
+        if (!match) {{
+            const available = menuItems.map(m => (m.innerText || "").replace(/\\n+/g, " ").trim());
+            // close menu
+            const backdrop = document.querySelector(".cdk-overlay-backdrop");
+            if (backdrop) backdrop.click();
+            return {{ ok: false, error: "Action not found in tile menu: " + actionName, available }};
+        }}
+
+        match.click();
+        return {{ ok: true, action: actionName, tile: label, clickedMenuItem: (match.innerText || "").replace(/\\n+/g, " ").trim() }};
+    }})()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def open_add_media_menu(page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Opens the top-bar 'Add media' (+) menu and returns available creation actions."""
+    page_id = page_id or find_google_flow_page()
+    js_code = """(() => {
+        const addBtn = document.querySelector("button[aria-label='Add media menu']");
+        if (!addBtn) return { ok: false, error: "Add media menu button not found" };
+        addBtn.click();
+
+        const menu = document.querySelector(".mat-mdc-menu-panel, [role='menu']");
+        if (!menu) return { ok: false, error: "Menu did not open" };
+        const items = Array.from(menu.querySelectorAll("button, [role='menuitem']")).map(m => (m.innerText || "").replace(/\\n+/g, " ").trim());
+        return {
+            ok: true,
+            menuOpen: true,
+            options: items
+        };
+    })()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def trigger_add_menu_action(action_name: str, page_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Triggers an action from the top-bar 'Add media' menu.
+    Options: 'upload', 'new collection', 'create character', 'new scene'.
+    """
+    page_id = page_id or find_google_flow_page()
+    js_code = f"""(() => {{
+        const act = {json.dumps(action_name.lower().strip())};
+        const addBtn = document.querySelector("button[aria-label='Add media menu']");
+        if (!addBtn) return {{ ok: false, error: "Add media menu button not found" }};
+        addBtn.click();
+
+        const menu = document.querySelector(".mat-mdc-menu-panel, [role='menu']");
+        if (!menu) return {{ ok: false, error: "Menu did not open" }};
+        const items = Array.from(menu.querySelectorAll("button, [role='menuitem']"));
+        const match = items.find(m => (m.innerText || "").toLowerCase().includes(act));
+        if (!match) {{
+            const available = items.map(m => (m.innerText || "").replace(/\\n+/g, " ").trim());
+            const backdrop = document.querySelector(".cdk-overlay-backdrop");
+            if (backdrop) backdrop.click();
+            return {{ ok: false, error: "Option not found in Add menu: " + act, available }};
+        }}
+
+        match.click();
+        return {{ ok: true, clicked: (match.innerText || "").replace(/\\n+/g, " ").trim(), url: window.location.href }};
+    }})()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    time.sleep(0.8)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def toggle_agent_panel(state: str = "toggle", page_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Toggles, opens, or closes the right-side Agent chat & prompt panel.
+    state: 'toggle', 'open', or 'close'.
+    """
+    page_id = page_id or find_google_flow_page()
+    js_code = f"""(() => {{
+        const desired = {json.dumps(state.lower().strip())};
+        const closeBtn = document.querySelector(".agent-panel-animation-container button.close, .agent-panel-wrapper button");
+        const expandBtn = document.querySelector("button[aria-label='Expand'], button.expand-button");
+
+        const isOpen = !expandBtn && !!closeBtn;
+
+        if (desired === "close" || (desired === "toggle" && isOpen)) {{
+            const btn = Array.from(document.querySelectorAll(".agent-panel-animation-container button")).find(b => (b.innerText || "").trim() === "close");
+            if (btn) {{
+                btn.click();
+                return {{ ok: true, state: "closed" }};
+            }}
+            return {{ ok: false, error: "Close button not found in panel" }};
+        }}
+
+        if (desired === "open" || (desired === "toggle" && !isOpen)) {{
+            if (expandBtn) {{
+                expandBtn.click();
+                return {{ ok: true, state: "open" }};
+            }}
+            return {{ ok: true, state: "already_open" }};
+        }}
+
+        return {{ ok: true, state: isOpen ? "open" : "closed" }};
+    }})()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    time.sleep(0.5)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
+def select_character_archetype(archetype_name: str, page_id: Optional[str] = None) -> Dict[str, Any]:
+    """Clicks a character archetype template on the character creation screen."""
+    page_id = page_id or find_google_flow_page()
+    js_code = f"""(() => {{
+        const target = {json.dumps(archetype_name.lower().strip())};
+        const buttons = Array.from(document.querySelectorAll("button")).filter(b => (b.innerText || "").trim().startsWith("The "));
+        const match = buttons.find(b => (b.innerText || "").toLowerCase().includes(target));
+        if (!match) {{
+            const available = buttons.map(b => (b.innerText || "").replace(/\\n+/g, " ").trim());
+            return {{ ok: false, error: "Archetype not found: " + target, available }};
+        }}
+        match.click();
+        return {{ ok: true, selectedArchetype: (match.innerText || "").replace(/\\n+/g, " ").trim() }};
+    }})()"""
+    raw = run_orca_eval(js_code, page_id=page_id)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"ok": True, "raw": raw}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Google Flow Autonomous Agent & Coworker Driver"
@@ -414,6 +827,19 @@ def main():
     parser.add_argument("--approve", action="store_true", help="Approve pending generation/credit request")
     parser.add_argument("--reject", action="store_true", help="Reject pending generation/credit request")
     parser.add_argument("--always-approve", action="store_true", help="Always approve generation requests")
+    parser.add_argument("--characters", action="store_true", help="Navigate to Characters tab and list characters")
+    parser.add_argument("--new-character", action="store_true", help="Open character creation screen")
+    parser.add_argument("--back", action="store_true", help="Navigate back from character creation or modal")
+    parser.add_argument("--nav", type=str, help="Navigate to sidebar tab (e.g. 'Characters', 'All media', 'Images', 'Videos', 'Scenes', 'Uploads')")
+    parser.add_argument("--sidebar-tabs", action="store_true", help="List all sidebar navigation tabs and active status")
+    parser.add_argument("--toggle-sidebar", action="store_true", help="Collapse or expand the left sidebar drawer")
+    parser.add_argument("--gallery", action="store_true", help="List all media & character tiles in the current view with available actions")
+    parser.add_argument("--tile", type=str, help="Target tile index (1-based) or label substring for tile action")
+    parser.add_argument("--tile-action", type=str, help="Action to perform on --tile: 'favorite', 'reuse prompt', 'animate', 'add to prompt', 'download', 'copy', 'rename', 'trash', 'preview'")
+    parser.add_argument("--add-menu", action="store_true", help="Inspect options in top Add media (+) menu")
+    parser.add_argument("--add-action", type=str, help="Trigger action from Add media menu: 'upload', 'new collection', 'create character', 'new scene'")
+    parser.add_argument("--toggle-panel", type=str, nargs="?", const="toggle", help="Toggle, open, or close the agent prompt panel ('open', 'close', 'toggle')")
+    parser.add_argument("--archetype", type=str, help="Select character archetype template on character creation screen")
     parser.add_argument("--page", type=str, help="Specific browser page ID")
     parser.add_argument("-j", "--json", action="store_true", help="Emit JSON output")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress decorative banners")
@@ -422,6 +848,166 @@ def main():
 
     try:
         page_id = args.page or find_google_flow_page()
+
+        if args.sidebar_tabs:
+            res = list_sidebar_tabs(page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print("=" * 75)
+                print(f" 📂 SIDEBAR NAVIGATION TABS ({res.get('totalTabs', 0)} items)")
+                print(f" Current Active: {res.get('activeTab') or 'None'}")
+                print("=" * 75)
+                for i, t in enumerate(res.get("tabs", []), 1):
+                    act_icon = "⭐ [ACTIVE]" if t.get("active") else "  "
+                    print(f"[{i:2d}] {act_icon} {t.get('title')}")
+                print("=" * 75)
+            return
+
+        if args.toggle_sidebar:
+            res = toggle_sidebar_drawer(page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"✅ Toggled sidebar drawer: {res.get('clicked')}")
+                else:
+                    print(f"❌ Failed to toggle sidebar: {res.get('error')}")
+            return
+
+        if args.gallery:
+            res = get_gallery_items(page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print("=" * 75)
+                print(f" 🖼️ GALLERY VIEW ITEMS ({res.get('count', 0)} items)")
+                print("=" * 75)
+                for itm in res.get("items", []):
+                    type_icon = "🎬" if itm["type"] == "video" else ("🎭" if itm["type"] == "character" else "🖼️")
+                    print(f"[{itm['index']:2d}] {type_icon} {itm['label']} ({itm['type'].upper()})")
+                    actions = []
+                    if itm["hasFavorite"]: actions.append("Favorite")
+                    if itm["hasReusePrompt"]: actions.append("Reuse prompt")
+                    if itm["hasMoreOptions"]: actions.append("More options")
+                    print(f"     Actions: {', '.join(actions)}")
+                print("=" * 75)
+            return
+
+        if args.tile_action:
+            if not args.tile:
+                raise GoogleFlowError("--tile <index|name> is required when using --tile-action")
+            try:
+                target_val = int(args.tile)
+            except ValueError:
+                target_val = args.tile
+            res = trigger_tile_action(target_val, args.tile_action, page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"✅ Tile Action Success: [{res.get('tile')}] -> {res.get('action')}")
+                else:
+                    print(f"❌ Tile Action Error: {res.get('error')}")
+            return
+
+        if args.add_menu:
+            res = open_add_media_menu(page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print("=" * 75)
+                print(" ➕ ADD MEDIA MENU OPTIONS")
+                print("=" * 75)
+                for opt in res.get("options", []):
+                    print(f"  • {opt}")
+                print("=" * 75)
+            return
+
+        if args.add_action:
+            res = trigger_add_menu_action(args.add_action, page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"✅ Clicked Add Menu Action: {res.get('clicked')}")
+                else:
+                    print(f"❌ Failed Add Menu Action: {res.get('error')}")
+            return
+
+        if args.toggle_panel:
+            res = toggle_agent_panel(state=args.toggle_panel, page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"✅ Agent Panel State: {res.get('state')}")
+                else:
+                    print(f"❌ Failed to toggle agent panel: {res.get('error')}")
+            return
+
+        if args.archetype:
+            res = select_character_archetype(args.archetype, page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"✅ Selected Archetype: {res.get('selectedArchetype')}")
+                else:
+                    print(f"❌ Archetype Error: {res.get('error')}")
+            return
+
+        if args.nav:
+            res = navigate_sidebar_tab(args.nav, page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"✅ Navigated to sidebar tab: {res.get('activeText')}")
+                else:
+                    print(f"❌ Failed to navigate: {res.get('error')}")
+            return
+
+        if args.characters:
+            chars = get_characters_info(page_id=page_id)
+            if args.json:
+                print(json.dumps(chars, indent=2))
+            else:
+                print("=" * 75)
+                print(f" 🎭 CHARACTERS IN PROJECT ({chars.get('charactersCount', 0)} characters)")
+                print("=" * 75)
+                for i, c in enumerate(chars.get("characters", []), 1):
+                    print(f"[{i}] 👤 {c.get('name')}")
+                    if c.get("thumbnail"):
+                        print(f"    Thumbnail: {c.get('thumbnail')[:80]}...")
+                print("-" * 75)
+                print(f"Available Actions: {', '.join(chars.get('actionTiles', []))}")
+            return
+
+        if args.new_character:
+            res = open_character_creator(page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print("✅ Navigated to Character Creation screen (/character)")
+                    print(f"URL: {res.get('url')}")
+                    print(f"Prompt Input: {'Ready' if res.get('hasPromptInput') else 'Not found'}")
+                    print(f"Sample Archetypes: {', '.join(res.get('archetypes', []))}")
+                else:
+                    print(f"❌ Failed to open character creator: {res.get('error')}")
+            return
+
+        if args.back:
+            res = navigate_back_from_creator(page_id=page_id)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"✅ Navigated back to: {res.get('url')}")
+                else:
+                    print(f"❌ Failed to navigate back: {res.get('error')}")
+            return
 
         if args.approve or args.always_approve or args.reject:
             decision = "always approve" if args.always_approve else ("reject" if args.reject else "approve")
